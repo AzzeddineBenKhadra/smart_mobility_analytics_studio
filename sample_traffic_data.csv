@@ -1,0 +1,11 @@
+timestamp,road_name,average_speed_kmh,vehicle_count,latitude,longitude
+2026-01-01 08:00,Airport Road,72,120,25.23,55.36
+2026-01-01 08:15,Airport Road,58,156,25.23,55.36
+2026-01-01 08:30,Airport Road,,171,25.24,55.37
+2026-01-01 08:45,Sheikh Zayed Road,45,220,25.20,55.27
+2026-01-01 09:00,Sheikh Zayed Road,39,245,25.20,55.27
+2026-01-01 09:15,Airport Road,62,160,25.23,55.36
+2026-01-01 09:30,Airport Road,55,175,25.23,55.36
+2026-01-01 09:45,Sheikh Zayed Road,42,230,25.20,55.27
+2026-01-01 10:00,Airport Road,67,130,25.23,55.36
+2026-01-01 10:15,Airport Road,67,130,25.23,55.36
