@@ -16,6 +16,9 @@ from sklearn.linear_model import LinearRegression
 from io import StringIO
 import re
 import json
+import zipfile
+from io import BytesIO
+
 
 
 # =========================================================
@@ -242,39 +245,116 @@ st.sidebar.info(
 
 
 # =========================================================
-# DATA UPLOAD
+# DATA UPLOAD — CSV, XLSX AND ZIP SUPPORT
 # =========================================================
 
-st.title("🚦 Smart Mobility Analytics Studio")
+st.title("Smart Mobility Analytics Studio")
 st.caption("Version 2.0 | Transportation Data Analytics & Machine Learning")
 
 uploaded_file = st.sidebar.file_uploader(
-    "Upload transportation CSV",
-    type=["csv"]
+    "Upload transportation data",
+    type=["csv", "xlsx", "zip"],
+    help="Upload a CSV, Excel workbook (.xlsx), or ZIP archive."
 )
 
 if uploaded_file is not None:
-    if st.session_state.uploaded_name != uploaded_file.name:
-        try:
-            uploaded_file.seek(0)
-            incoming_df = pd.read_csv(uploaded_file)
+    try:
+        file_bytes = uploaded_file.getvalue()
+        filename = uploaded_file.name.lower()
+
+        selected_file = uploaded_file.name
+        selected_sheet = None
+        data_bytes = file_bytes
+
+        # Handle ZIP archives containing CSV or Excel files
+        if filename.endswith(".zip"):
+            with zipfile.ZipFile(BytesIO(file_bytes)) as archive:
+                supported_files = [
+                    name for name in archive.namelist()
+                    if not name.endswith("/")
+                    and name.lower().endswith((".csv", ".xlsx"))
+                    and not name.startswith("__MACOSX/")
+                    and not name.split("/")[-1].startswith("~$")
+                    and not name.split("/")[-1].startswith("._")
+                ]
+
+                if not supported_files:
+                    st.error(
+                        "The ZIP archive contains no supported CSV or XLSX files."
+                    )
+                    st.stop()
+
+                selected_file = st.sidebar.selectbox(
+                    "Choose a file inside the ZIP",
+                    options=supported_files,
+                    key=f"zip_file_{uploaded_file.name}_{uploaded_file.size}"
+                )
+
+                data_bytes = archive.read(selected_file)
+
+        # Choose an Excel worksheet when needed
+        if selected_file.lower().endswith(".xlsx"):
+            excel_file = pd.ExcelFile(BytesIO(data_bytes), engine="openpyxl")
+
+            if not excel_file.sheet_names:
+                st.error("The Excel workbook contains no worksheets.")
+                st.stop()
+
+            selected_sheet = st.sidebar.selectbox(
+                "Choose an Excel worksheet",
+                options=excel_file.sheet_names,
+                key=(
+                    f"sheet_{uploaded_file.name}_"
+                    f"{uploaded_file.size}_{selected_file}"
+                )
+            )
+
+        # Identify the selected dataset, including ZIP member and worksheet
+        data_id = (
+            uploaded_file.name,
+            uploaded_file.size,
+            selected_file,
+            selected_sheet
+        )
+
+        # Load only when the selected dataset changes
+        if st.session_state.get("current_upload_id") != data_id:
+            if selected_file.lower().endswith(".csv"):
+                incoming_df = pd.read_csv(BytesIO(data_bytes))
+            else:
+                incoming_df = pd.read_excel(
+                    BytesIO(data_bytes),
+                    sheet_name=selected_sheet,
+                    engine="openpyxl"
+                )
+
+            if incoming_df.empty or len(incoming_df.columns) == 0:
+                st.error("The selected file contains no usable data.")
+                st.stop()
 
             st.session_state.original_df = incoming_df.copy(deep=True)
             st.session_state.df = incoming_df.copy(deep=True)
             st.session_state.history = []
             st.session_state.cleaning_log = []
-            st.session_state.uploaded_name = uploaded_file.name
+            st.session_state.uploaded_name = selected_file
+            st.session_state.current_upload_id = data_id
 
-            st.sidebar.success("Dataset loaded successfully.")
+            st.sidebar.success(
+                f"Loaded {len(incoming_df):,} rows successfully."
+            )
 
-        except Exception as exc:
-            st.error(f"Could not read this CSV file: {exc}")
+    except zipfile.BadZipFile:
+        st.error("The uploaded ZIP file is invalid or corrupted.")
+        st.stop()
 
+    except Exception as exc:
+        st.error(f"Could not load the uploaded data: {exc}")
+        st.stop()
 
 df = st.session_state.df
 
 if df is None:
-    st.info("👈 Upload a CSV file from the sidebar to get started.")
+    st.info("👈 Upload a CSV, XLSX, or ZIP file from the sidebar.")
 
     st.markdown("### What V2 can do")
 
@@ -284,21 +364,19 @@ if df is None:
         st.subheader("🧹 Data Quality")
         st.write(
             "Handle missing values, remove duplicates, "
-            "validate columns, and undo cleaning operations."
+            "and undo cleaning operations."
         )
 
     with col2:
         st.subheader("🗺️ Spatial Analytics")
         st.write(
-            "Detect geographic coordinates and explore "
-            "valid location records on an interactive map."
+            "Explore valid latitude and longitude records on a map."
         )
 
     with col3:
         st.subheader("🤖 Machine Learning")
         st.write(
-            "Train and evaluate a traffic prediction model "
-            "when your dataset contains a suitable numeric target."
+            "Train and evaluate traffic prediction models."
         )
 
     st.stop()

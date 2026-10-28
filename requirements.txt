@@ -9,3 +9,4 @@ plotly
 folium
 streamlit-folium
 scikit-learn
+openpyxl
