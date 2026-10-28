@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -18,8 +17,42 @@ import re
 import json
 import zipfile
 from io import BytesIO
+import re
 
 
+
+
+# =========================================================
+# FIX: DARK MODE TEXT VISIBILITY IN WHITE METRIC CARDS
+# =========================================================
+
+st.markdown(
+    """
+    <style>
+    /* Make text inside white metric cards readable */
+    [data-testid="stMetric"] {
+        background-color: #ffffff !important;
+        padding: 16px !important;
+        border-radius: 10px !important;
+    }
+
+    [data-testid="stMetric"] label,
+    [data-testid="stMetricLabel"],
+    [data-testid="stMetricValue"],
+    [data-testid="stMetricDelta"],
+    [data-testid="stMetric"] p,
+    [data-testid="stMetric"] div {
+        color: #000000 !important;
+    }
+
+    /* Keep positive and negative metric indicators visible */
+    [data-testid="stMetricDelta"] svg {
+        fill: currentColor !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
 # =========================================================
 # PAGE CONFIGURATION
@@ -380,6 +413,612 @@ if df is None:
         )
 
     st.stop()
+
+    
+# =========================================================
+# PHASE 1 — SMART DATA INTELLIGENCE
+# Insert before: # COMMON DATA INFORMATION
+# =========================================================
+
+def sd_normalize_name(name):
+    """Normalize column names for matching."""
+    return re.sub(r"[^a-z0-9]+", "", str(name).lower())
+
+
+def sd_detect_columns(data):
+    """Identify common transport fields using names and aliases."""
+    aliases = {
+        "latitude": [
+            "latitude", "lat", "gpslatitude", "ycoordinate",
+            "coordy", "pointlatitude"
+        ],
+        "longitude": [
+            "longitude", "lon", "lng", "long", "gpslongitude",
+            "xcoordinate", "coordx", "pointlongitude"
+        ],
+        "timestamp": [
+            "timestamp", "datetime", "dateandtime", "eventtime",
+            "recordedat", "measurementtime", "datetimeutc"
+        ],
+        "speed": [
+            "speed", "speedkmh", "speedkph", "speedmph",
+            "vehiclespeed", "avgspeed", "averagespeed"
+        ],
+        "traffic_volume": [
+            "trafficvolume", "volume", "flow", "trafficflow",
+            "vehiclecount", "vehicles", "vehiclevolume",
+            "flowrate", "countvehicles"
+        ],
+        "road_id": [
+            "roadid", "roadidentifier", "roadcode", "segmentid",
+            "linkid", "streetid", "highwayid", "roadname",
+            "streetname", "segment", "road"
+        ],
+    }
+
+    normalized = {
+        column: sd_normalize_name(column)
+        for column in data.columns
+    }
+
+    detected = {}
+
+    for field, candidates in aliases.items():
+        matches = [
+            column for column, normalized_name in normalized.items()
+            if normalized_name in candidates
+        ]
+
+        # Fallback to partial matching for common column-name variations.
+        if not matches:
+            for column, normalized_name in normalized.items():
+                if field == "latitude" and (
+                    normalized_name.endswith("latitude")
+                    or normalized_name == "lat"
+                ):
+                    matches.append(column)
+                elif field == "longitude" and (
+                    normalized_name.endswith("longitude")
+                    or normalized_name in ("lon", "lng", "long")
+                ):
+                    matches.append(column)
+                elif field == "timestamp" and any(
+                    word in normalized_name
+                    for word in ("timestamp", "datetime")
+                ):
+                    matches.append(column)
+                elif field == "speed" and "speed" in normalized_name:
+                    matches.append(column)
+                elif field == "traffic_volume" and any(
+                    word in normalized_name
+                    for word in ("trafficvolume", "vehiclecount", "trafficflow")
+                ):
+                    matches.append(column)
+                elif field == "road_id" and any(
+                    word in normalized_name
+                    for word in ("roadid", "segmentid", "linkid", "roadname")
+                ):
+                    matches.append(column)
+
+        if matches:
+            detected[field] = matches[0]
+
+    return detected
+
+
+def sd_outlier_mask(series):
+    """
+    Find extreme numeric values using the IQR rule.
+    Returns a Boolean mask aligned with the original index.
+    """
+    values = pd.to_numeric(series, errors="coerce")
+    valid = values.dropna()
+
+    if len(valid) < 8:
+        return pd.Series(False, index=series.index)
+
+    q1 = valid.quantile(0.25)
+    q3 = valid.quantile(0.75)
+    iqr = q3 - q1
+
+    if pd.isna(iqr) or iqr == 0:
+        return pd.Series(False, index=series.index)
+
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+
+    return ((values < lower) | (values > upper)).fillna(False)
+
+
+def sd_profile_data(data, detected):
+    """Profile the dataset and return quality findings."""
+    row_count, column_count = data.shape
+    total_cells = max(row_count * column_count, 1)
+
+    missing_cells = int(data.isna().sum().sum())
+    duplicate_rows = int(data.duplicated().sum())
+
+    findings = {
+        "rows": row_count,
+        "columns": column_count,
+        "missing_cells": missing_cells,
+        "missing_pct": missing_cells / total_cells * 100,
+        "duplicate_rows": duplicate_rows,
+        "invalid_coordinates": 0,
+        "invalid_timestamps": 0,
+        "unusual_speed": 0,
+        "unusual_volume": 0,
+        "coordinate_rows_checked": 0,
+        "timestamp_rows_checked": 0,
+    }
+
+    # Validate geographic coordinates when both fields are available.
+    lat_col = detected.get("latitude")
+    lon_col = detected.get("longitude")
+
+    if lat_col and lon_col:
+        lat = pd.to_numeric(data[lat_col], errors="coerce")
+        lon = pd.to_numeric(data[lon_col], errors="coerce")
+
+        has_both = data[lat_col].notna() & data[lon_col].notna()
+        findings["coordinate_rows_checked"] = int(has_both.sum())
+
+        invalid = (
+            has_both
+            & (
+                lat.isna()
+                | lon.isna()
+                | ~lat.between(-90, 90)
+                | ~lon.between(-180, 180)
+            )
+        )
+
+        # A coordinate pair that cannot be converted is invalid too.
+        findings["invalid_coordinates"] = int(invalid.sum())
+
+    # Check whether timestamp values can be parsed.
+    time_col = detected.get("timestamp")
+
+    if time_col:
+        present = data[time_col].notna()
+        findings["timestamp_rows_checked"] = int(present.sum())
+
+        if present.any():
+            parsed = pd.to_datetime(
+                data.loc[present, time_col],
+                errors="coerce",
+                utc=True
+            )
+            findings["invalid_timestamps"] = int(parsed.isna().sum())
+
+    # Check speed and traffic-volume columns.
+    speed_col = detected.get("speed")
+
+    if speed_col:
+        speed = pd.to_numeric(data[speed_col], errors="coerce")
+        speed_outliers = sd_outlier_mask(data[speed_col])
+
+        # Negative speeds and values over 250 are suspicious.
+        # The upper threshold is a screening rule, not a universal law.
+        hard_invalid = (speed < 0) | (speed > 250)
+
+        findings["unusual_speed"] = int(
+            (speed_outliers | hard_invalid.fillna(False)).sum()
+        )
+
+    volume_col = detected.get("traffic_volume")
+
+    if volume_col:
+        volume = pd.to_numeric(data[volume_col], errors="coerce")
+        volume_outliers = sd_outlier_mask(data[volume_col])
+        hard_invalid = volume < 0
+
+        findings["unusual_volume"] = int(
+            (volume_outliers | hard_invalid.fillna(False)).sum()
+        )
+
+    # Transparent heuristic score: a screening indicator, not a standard.
+    row_denominator = max(row_count, 1)
+    missing_penalty = min(findings["missing_pct"] * 0.35, 35)
+    duplicate_penalty = min(
+        findings["duplicate_rows"] / row_denominator * 100 * 0.20, 20
+    )
+    coordinate_penalty = min(
+        findings["invalid_coordinates"] / row_denominator * 100 * 0.20, 20
+    )
+    timestamp_penalty = min(
+        findings["invalid_timestamps"] / row_denominator * 100 * 0.10, 10
+    )
+    unusual_penalty = min(
+        (
+            findings["unusual_speed"] + findings["unusual_volume"]
+        ) / row_denominator * 100 * 0.15,
+        15
+    )
+
+    findings["quality_score"] = round(max(
+        0,
+        100
+        - missing_penalty
+        - duplicate_penalty
+        - coordinate_penalty
+        - timestamp_penalty
+        - unusual_penalty
+    ))
+
+    return findings
+
+
+# ---------------------------------------------------------
+# DATA INTELLIGENCE DASHBOARD
+# ---------------------------------------------------------
+
+st.header("Smart Data Intelligence")
+st.caption(
+    "Automatically profile transport data, identify potential issues, "
+    "and choose which cleaning actions to apply."
+)
+
+sd_df = st.session_state.df
+
+if sd_df is None or sd_df.empty:
+    st.info("Upload a dataset to run Smart Data Intelligence.")
+else:
+    sd_detected = sd_detect_columns(sd_df)
+
+    # Use the full dataset for counts, but a small sample for preview.
+    sd_sample_size = min(len(sd_df), 5000)
+    sd_sample = sd_df.head(sd_sample_size)
+
+    with st.spinner("Profiling dataset and checking data quality..."):
+        sd_findings = sd_profile_data(sd_df, sd_detected)
+
+    sd_score = sd_findings["quality_score"]
+
+    if sd_score >= 90:
+        sd_score_label = "Good"
+    elif sd_score >= 70:
+        sd_score_label = "Needs attention"
+    else:
+        sd_score_label = "Poor"
+
+    sd_col1, sd_col2, sd_col3, sd_col4 = st.columns(4)
+
+    sd_col1.metric("Data quality score", f"{sd_score}/100", sd_score_label)
+    sd_col2.metric("Rows", f"{len(sd_df):,}")
+    sd_col3.metric("Columns", f"{len(sd_df.columns):,}")
+    sd_col4.metric(
+        "Missing cells",
+        f"{sd_findings['missing_cells']:,}",
+        f"{sd_findings['missing_pct']:.1f}% of all cells"
+    )
+
+    st.caption(
+        "The score is a transparent heuristic for prioritizing data checks. "
+        "It is not a certified data-quality standard."
+    )
+
+    # Field detection results.
+    with st.expander("🔎 Detected transportation fields", expanded=True):
+        sd_fields = [
+            ("Latitude", "latitude"),
+            ("Longitude", "longitude"),
+            ("Timestamp", "timestamp"),
+            ("Speed", "speed"),
+            ("Traffic volume", "traffic_volume"),
+            ("Road / segment identifier", "road_id"),
+        ]
+
+        sd_field_col1, sd_field_col2 = st.columns(2)
+
+        for index, (label, field) in enumerate(sd_fields):
+            target_col = sd_field_col1 if index % 2 == 0 else sd_field_col2
+
+            with target_col:
+                detected_column = sd_detected.get(field)
+
+                if detected_column:
+                    st.success(f"**{label}:** `{detected_column}`")
+                else:
+                    st.warning(f"**{label}:** Not detected")
+
+        if sd_detected:
+            st.caption(
+                "Detection is based primarily on column names. "
+                "Check the matches before relying on the results."
+            )
+
+    # Data quality findings.
+    with st.expander("🩺 Data-quality findings", expanded=True):
+        sd_issue_rows = [
+            ("Missing cells", sd_findings["missing_cells"],
+             "Review affected columns; choose whether to fill missing values."),
+            ("Duplicate rows", sd_findings["duplicate_rows"],
+             "Remove exact duplicate rows if they are accidental."),
+            ("Invalid coordinate pairs", sd_findings["invalid_coordinates"],
+             "Check latitude/longitude ranges and coordinate formats."),
+            ("Unparseable timestamps", sd_findings["invalid_timestamps"],
+             "Review date formats and timezone assumptions."),
+            ("Unusual speed values", sd_findings["unusual_speed"],
+             "Check units, sensor errors, and possible legitimate extremes."),
+            ("Unusual traffic-volume values", sd_findings["unusual_volume"],
+             "Check negative counts, measurement intervals, and extreme values."),
+        ]
+
+        sd_any_issue = False
+
+        for issue_name, issue_count, explanation in sd_issue_rows:
+            if issue_count > 0:
+                sd_any_issue = True
+                st.warning(
+                    f"**{issue_name}: {issue_count:,}** — {explanation}"
+                )
+
+        if not sd_any_issue:
+            st.success(
+                "No issues were detected by the current checks. "
+                "This does not guarantee the dataset is error-free."
+            )
+
+        if not sd_detected.get("latitude") or not sd_detected.get("longitude"):
+            st.info(
+                "Coordinate validation is unavailable until both latitude "
+                "and longitude fields are identified."
+            )
+
+    # Missing-value breakdown.
+    with st.expander("📋 Column-level data profile"):
+        sd_profile_table = pd.DataFrame({
+            "Column": sd_df.columns,
+            "Data type": [str(dtype) for dtype in sd_df.dtypes],
+            "Missing values": [
+                int(sd_df[col].isna().sum()) for col in sd_df.columns
+            ],
+            "Missing %": [
+                round(sd_df[col].isna().mean() * 100, 2)
+                for col in sd_df.columns
+            ],
+            "Unique values": [
+                int(sd_df[col].nunique(dropna=True))
+                for col in sd_df.columns
+            ],
+        })
+
+        st.dataframe(sd_profile_table, use_container_width=True)
+
+        st.caption(
+            f"Previewing the first {len(sd_sample):,} of "
+            f"{len(sd_df):,} records below."
+        )
+        st.dataframe(sd_sample, use_container_width=True)
+
+    # Recommend cleaning actions; changes only occur after approval.
+    st.subheader("🧹 Recommended cleaning actions")
+    st.write(
+        "Select the actions you want to apply. Review the description "
+        "before approving changes."
+    )
+
+    sd_actions = {}
+
+    sd_actions["duplicates"] = st.checkbox(
+        f"Remove exact duplicate rows ({sd_findings['duplicate_rows']:,})",
+        value=False,
+        disabled=sd_findings["duplicate_rows"] == 0,
+        key="sd_action_duplicates"
+    )
+
+    sd_actions["coordinates"] = st.checkbox(
+        "Set invalid latitude/longitude pairs to missing values",
+        value=False,
+        disabled=(
+            not sd_detected.get("latitude")
+            or not sd_detected.get("longitude")
+            or sd_findings["invalid_coordinates"] == 0
+        ),
+        key="sd_action_coordinates"
+    )
+
+    sd_actions["missing"] = st.checkbox(
+        "Fill missing values in eligible columns "
+        "(numeric: median; text: most frequent value)",
+        value=False,
+        disabled=sd_findings["missing_cells"] == 0,
+        key="sd_action_missing"
+    )
+
+    sd_actions["outliers"] = st.checkbox(
+        "Set unusual speed and traffic-volume measurements to missing",
+        value=False,
+        disabled=(
+            not sd_detected.get("speed")
+            and not sd_detected.get("traffic_volume")
+        ),
+        key="sd_action_outliers"
+    )
+
+    st.caption(
+        "Missing-value filling skips detected coordinates, timestamps, "
+        "and road identifiers. Outliers are flagged using statistical "
+        "rules and may be legitimate observations."
+    )
+
+    sd_selected_actions = [
+        name for name, selected in sd_actions.items() if selected
+    ]
+
+    if st.button(
+        "✅ Approve and apply selected cleaning actions",
+        type="primary",
+        disabled=len(sd_selected_actions) == 0,
+        key="sd_apply_cleaning"
+    ):
+        # Create a working copy only after the user approves.
+        sd_cleaned = st.session_state.df.copy(deep=True)
+        sd_change_log = []
+
+        try:
+            # 1. Remove exact duplicate rows.
+            if sd_actions["duplicates"]:
+                before_rows = len(sd_cleaned)
+                sd_cleaned = sd_cleaned.drop_duplicates()
+                removed = before_rows - len(sd_cleaned)
+
+                sd_change_log.append(
+                    f"Removed {removed:,} exact duplicate rows."
+                )
+
+            # 2. Mark invalid coordinate pairs as missing.
+            if sd_actions["coordinates"]:
+                lat_col = sd_detected["latitude"]
+                lon_col = sd_detected["longitude"]
+
+                lat = pd.to_numeric(sd_cleaned[lat_col], errors="coerce")
+                lon = pd.to_numeric(sd_cleaned[lon_col], errors="coerce")
+
+                # Missing coordinates stay missing; invalid values are
+                # converted to NaN, not replaced with guessed locations.
+                invalid_lat = lat.notna() & ~lat.between(-90, 90)
+                invalid_lon = lon.notna() & ~lon.between(-180, 180)
+
+                sd_cleaned.loc[invalid_lat, lat_col] = np.nan
+                sd_cleaned.loc[invalid_lon, lon_col] = np.nan
+
+                sd_change_log.append(
+                    "Set out-of-range latitude/longitude values to missing."
+                )
+
+            # 3. Fill eligible missing values.
+            if sd_actions["missing"]:
+                protected_fields = {
+                    sd_detected.get("latitude"),
+                    sd_detected.get("longitude"),
+                    sd_detected.get("timestamp"),
+                    sd_detected.get("road_id"),
+                }
+                protected_fields.discard(None)
+
+                filled_columns = []
+
+                for column in sd_cleaned.columns:
+                    if column in protected_fields:
+                        continue
+
+                    missing_mask = sd_cleaned[column].isna()
+
+                    if not missing_mask.any():
+                        continue
+
+                    if pd.api.types.is_numeric_dtype(sd_cleaned[column]):
+                        median_value = sd_cleaned[column].median()
+
+                        if pd.notna(median_value):
+                            sd_cleaned[column] = sd_cleaned[column].fillna(
+                                median_value
+                            )
+                            filled_columns.append(str(column))
+
+                    else:
+                        modes = sd_cleaned[column].mode(dropna=True)
+
+                        if not modes.empty:
+                            sd_cleaned[column] = sd_cleaned[column].fillna(
+                                modes.iloc[0]
+                            )
+                            filled_columns.append(str(column))
+
+                sd_change_log.append(
+                    "Filled eligible columns: "
+                    + (
+                        ", ".join(filled_columns)
+                        if filled_columns
+                        else "no eligible columns required filling"
+                    )
+                )
+
+            # 4. Mark suspicious speed/volume values as missing.
+            if sd_actions["outliers"]:
+                outlier_columns = [
+                    sd_detected.get("speed"),
+                    sd_detected.get("traffic_volume"),
+                ]
+
+                changed = []
+
+                for column in outlier_columns:
+                    if column is None:
+                        continue
+
+                    numeric_values = pd.to_numeric(
+                        sd_cleaned[column], errors="coerce"
+                    )
+
+                    mask = sd_outlier_mask(sd_cleaned[column])
+
+                    if column == sd_detected.get("speed"):
+                        mask = mask | (
+                            (numeric_values < 0) | (numeric_values > 250)
+                        ).fillna(False)
+
+                    if column == sd_detected.get("traffic_volume"):
+                        mask = mask | (numeric_values < 0).fillna(False)
+
+                    count = int(mask.sum())
+
+                    if count:
+                        sd_cleaned.loc[mask, column] = np.nan
+                        changed.append(f"{column}: {count:,} values")
+
+                sd_change_log.append(
+                    "Marked unusual measurements as missing: "
+                    + (
+                        "; ".join(changed)
+                        if changed
+                        else "no unusual values found"
+                    )
+                )
+
+            # Save a snapshot only when the user approves modifications.
+            if not sd_cleaned.equals(st.session_state.df):
+                if "history" not in st.session_state:
+                    st.session_state.history = []
+
+                st.session_state.history.append(
+                    st.session_state.df.copy(deep=True)
+                )
+
+                # Keep memory use bounded for undo history.
+                st.session_state.history = st.session_state.history[-5:]
+
+                st.session_state.df = sd_cleaned
+
+                if "cleaning_log" not in st.session_state:
+                    st.session_state.cleaning_log = []
+
+                st.session_state.cleaning_log.extend(sd_change_log)
+
+                st.success("Selected cleaning actions applied.")
+                for item in sd_change_log:
+                    st.write(f"- {item}")
+
+                st.rerun()
+            else:
+                st.info("No data changes were necessary.")
+
+        except Exception as exc:
+            st.error(f"Cleaning could not be completed: {exc}")
+
+    # Efficient processing note.
+    if len(sd_df) > 100_000:
+        st.info(
+            "Large dataset detected. Profiling uses full-data quality counts, "
+            "while the preview is limited to 5,000 rows. For very large files, "
+            "consider Parquet, chunked CSV processing, or a database backend."
+        )
+
+# Refresh the reference for the rest of the existing app.
+df = st.session_state.df
+
 
 
 # =========================================================
@@ -1026,8 +1665,8 @@ elif page == "Interactive Map":
             )
 
             # Avoid rendering too many individual markers.
-            marker_limit = 1500
-            plotted_df = map_df.head(marker_limit)
+            
+            plotted_df = map_df
 
             for _, row in plotted_df.iterrows():
                 popup_lines = [
@@ -1059,11 +1698,9 @@ elif page == "Interactive Map":
                 returned_objects=[]
             )
 
-            if len(map_df) > marker_limit:
-                st.info(
-                    f"Showing the first {marker_limit:,} valid records "
-                    f"out of {len(map_df):,} to keep the map responsive."
-                )
+            st.caption(
+                f"Showing all {len(plotted_df):,} valid records on the map."
+            )   
 
             st.caption(
                 "The optional color selection is available for future "
