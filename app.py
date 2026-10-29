@@ -1,2027 +1,1985 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.express as px
-import folium
+"""
+Smart Mobility Analytics Studio — V3 (fixed & cleaned)
 
-from streamlit_folium import st_folium
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
-from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression
-from io import StringIO
-import re
+Run with:  streamlit run app.py
+
+Main changes vs V2:
+  * st.set_page_config() is now the first Streamlit call (V2 crashed on start).
+  * One undo/history format and one cleaning-log format everywhere.
+  * One column-detection system + a sidebar "Column mapping" override
+    that every page shares.
+  * Heavy computations are cached per dataset version.
+  * Map: sampling, clustering, heatmap, working colour option.
+  * Prediction: chronological split, baseline comparison, feature influence,
+    results that survive reruns (e.g. clicking a download button).
+"""
+
+import html
 import json
+import re
+import warnings
 import zipfile
 from io import BytesIO
-import re
 
-
-
-
-# =========================================================
-# FIX: DARK MODE TEXT VISIBILITY IN WHITE METRIC CARDS
-# =========================================================
-
-st.markdown(
-    """
-    <style>
-    /* Make text inside white metric cards readable */
-    [data-testid="stMetric"] {
-        background-color: #ffffff !important;
-        padding: 16px !important;
-        border-radius: 10px !important;
-    }
-
-    [data-testid="stMetric"] label,
-    [data-testid="stMetricLabel"],
-    [data-testid="stMetricValue"],
-    [data-testid="stMetricDelta"],
-    [data-testid="stMetric"] p,
-    [data-testid="stMetric"] div {
-        color: #000000 !important;
-    }
-
-    /* Keep positive and negative metric indicators visible */
-    [data-testid="stMetricDelta"] svg {
-        fill: currentColor !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+import folium
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+from branca.colormap import LinearColormap
+from folium.plugins import HeatMap, MarkerCluster
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from streamlit_folium import st_folium
 
 # =========================================================
-# PAGE CONFIGURATION
+# PAGE CONFIGURATION  (must be the first Streamlit command)
 # =========================================================
 
 st.set_page_config(
-    page_title="Smart Mobility Analytics Studio V2",
+    page_title="Smart Mobility Analytics Studio",
     page_icon="🚦",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-st.markdown("""
-<style>
-.main {
-    background-color: #f5f7fb;
+# Theme-aware styling: no hard-coded text/background colours, so metric
+# cards stay readable in both light and dark mode.
+st.markdown(
+    """
+    <style>
+    .block-container { padding-top: 1.5rem; }
+    [data-testid="stMetric"] {
+        background-color: rgba(128, 128, 128, 0.08);
+        border: 1px solid rgba(128, 128, 128, 0.25);
+        border-radius: 10px;
+        padding: 12px 16px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# =========================================================
+# CONSTANTS
+# =========================================================
+
+MAX_HISTORY = 10            # undo snapshots kept
+MAX_HISTORY_MB = 400        # approximate memory cap for undo snapshots
+MAX_PLOT_POINTS = 50_000    # points sent to the browser for scatter/line/hist
+MAX_TRAIN_ROWS = 200_000    # training rows used for model fitting
+MAX_EXCEL_ROWS = 1_048_575
+
+FIELD_LABELS = {
+    "timestamp": "Timestamp / date",
+    "latitude": "Latitude",
+    "longitude": "Longitude",
+    "speed": "Speed",
+    "volume": "Traffic volume / count",
+    "road_id": "Road / segment ID",
 }
-.block-container {
-    padding-top: 1.5rem;
+
+# Matching tiers per field: exact compact name -> substring -> name token.
+FIELD_RULES = {
+    "timestamp": {
+        "exact": {"timestamp", "datetime", "dateandtime", "eventtime",
+                  "recordedat", "measurementtime", "datetimeutc",
+                  "timestamputc", "date", "time"},
+        "contains": ("timestamp", "datetime"),
+        "tokens": {"date", "time"},
+        "exclude": set(),
+    },
+    "latitude": {
+        "exact": {"latitude", "lat", "gpslatitude", "ycoordinate", "coordy",
+                  "pointlatitude", "ycoord"},
+        "contains": ("latitude",),
+        "tokens": {"lat", "latitude"},
+        "exclude": set(),
+    },
+    "longitude": {
+        "exact": {"longitude", "lon", "lng", "long", "gpslongitude",
+                  "xcoordinate", "coordx", "pointlongitude", "xcoord"},
+        "contains": ("longitude",),
+        "tokens": {"lon", "lng", "long", "longitude"},
+        "exclude": set(),
+    },
+    "speed": {
+        "exact": {"speed", "speedkmh", "speedkph", "speedmph", "vehiclespeed",
+                  "avgspeed", "averagespeed", "velocity"},
+        "contains": ("speed", "velocity"),
+        "tokens": {"speed", "velocity"},
+        "exclude": {"limit"},
+    },
+    "volume": {
+        "exact": {"trafficvolume", "volume", "flow", "trafficflow",
+                  "vehiclecount", "vehicles", "vehiclevolume", "flowrate",
+                  "countvehicles", "trafficcount"},
+        "contains": ("trafficvolume", "vehiclecount", "trafficcount",
+                     "trafficflow", "vehiclevolume", "flowrate"),
+        "tokens": {"volume", "vehicles", "flow"},
+        "exclude": set(),
+    },
+    "road_id": {
+        "exact": {"roadid", "roadidentifier", "roadcode", "segmentid",
+                  "linkid", "streetid", "highwayid", "roadname",
+                  "streetname", "segment", "road", "link"},
+        "contains": ("roadid", "segmentid", "linkid", "roadname",
+                     "streetname", "streetid"),
+        "tokens": set(),
+        "exclude": set(),
+    },
 }
-[data-testid="stMetric"] {
-    background-color: white;
-    padding: 15px;
-    border-radius: 10px;
-    border: 1px solid #e6eaf0;
-}
-</style>
-""", unsafe_allow_html=True)
+
+ID_TOKENS = {"id", "uid", "uuid", "idx", "index", "key", "code"}
 
 
 # =========================================================
 # SESSION STATE
 # =========================================================
 
-if "original_df" not in st.session_state:
-    st.session_state.original_df = None
+def init_state():
+    defaults = {
+        "original_df": None,
+        "df": None,
+        "df_version": 0,        # bumped every time the dataset changes
+        "dataset_id": 0,        # bumped every time a new file is loaded
+        "history": [],          # undo snapshots: {"action","data","log_len"}
+        "cleaning_log": [],     # list of dicts (one consistent format)
+        "uploaded_name": None,
+        "current_upload_id": None,
+        "last_model": None,
+        "flash": None,
+        "_cache": {},
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-if "df" not in st.session_state:
-    st.session_state.df = None
 
-if "history" not in st.session_state:
+def set_df(new_df):
+    """Replace the working dataset and invalidate cached computations."""
+    st.session_state.df = new_df
+    st.session_state.df_version += 1
+    st.session_state["_cache"] = {}
+
+
+def cached(name, compute, *key_parts):
+    """Per-dataset-version cache (cleared by set_df). Cheap, no hashing."""
+    store = st.session_state["_cache"]
+    key = (name, key_parts)
+    if key not in store:
+        store[key] = compute()
+    return store[key]
+
+
+def set_flash(level, text):
+    st.session_state.flash = (level, text)
+
+
+def show_flash():
+    flash = st.session_state.get("flash")
+    if flash:
+        level, text = flash
+        getattr(st, level, st.info)(text)
+        st.session_state.flash = None
+
+
+def load_dataset(incoming, name, data_id):
+    incoming = incoming.copy()
+    incoming.columns = [str(c).strip() for c in incoming.columns]
+
+    st.session_state.original_df = incoming.copy(deep=True)
     st.session_state.history = []
+    st.session_state.cleaning_log = []
+    st.session_state.last_model = None
+    st.session_state.uploaded_name = name
+    st.session_state.current_upload_id = data_id
+    st.session_state.dataset_id += 1
+    set_df(incoming.copy(deep=True))
 
-if "cleaning_log" not in st.session_state:
+
+# ---------- undo history & cleaning log (single format) ----------
+
+def push_history(action):
+    """Save the current dataset before a change.
+
+    Snapshots are stored by reference: the app never mutates
+    st.session_state.df in place (every operation works on a copy), so a
+    reference is safe and avoids a full deep copy on each step.
+    """
+    df = st.session_state.df
+    if df is None:
+        return
+
+    history = st.session_state.history
+    history.append({
+        "action": action,
+        "data": df,
+        "log_len": len(st.session_state.cleaning_log),
+    })
+
+    history = history[-MAX_HISTORY:]
+
+    def total_mb(items):
+        return sum(
+            i["data"].memory_usage(deep=False).sum() for i in items
+        ) / 1e6
+
+    while len(history) > 1 and total_mb(history) > MAX_HISTORY_MB:
+        history.pop(0)
+
+    st.session_state.history = history
+
+
+def undo_last():
+    """Restore the previous snapshot and trim the log to match."""
+    if not st.session_state.history:
+        return None
+
+    snapshot = st.session_state.history.pop()
+    set_df(snapshot["data"])
+    del st.session_state.cleaning_log[snapshot["log_len"]:]
+    return snapshot["action"]
+
+
+def reset_to_original():
+    set_df(st.session_state.original_df.copy(deep=True))
+    st.session_state.history = []
     st.session_state.cleaning_log = []
 
-if "uploaded_name" not in st.session_state:
-    st.session_state.uploaded_name = None
+
+def make_log_entry(operation, column, rows_before, df_after, details=""):
+    return {
+        "operation": operation,
+        "column": column,
+        "details": details,
+        "rows_before": int(rows_before),
+        "rows_after": int(len(df_after)),
+        "missing_after": int(df_after.isna().sum().sum()),
+    }
 
 
 # =========================================================
-# HELPER FUNCTIONS
+# GENERAL HELPERS
 # =========================================================
 
-def normalize_name(name):
-    """Normalize a column name for automatic detection."""
-    return re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
+def show_df(data, **kwargs):
+    """st.dataframe that works on old and new Streamlit versions."""
+    try:
+        st.dataframe(data, width="stretch", **kwargs)
+    except Exception:
+        st.dataframe(data, use_container_width=True, **kwargs)
 
 
-def detect_column(columns, keywords):
-    """Find the first column whose name contains a keyword."""
-    for col in columns:
-        normalized = normalize_name(col)
-        if any(keyword in normalized for keyword in keywords):
-            return col
-    return None
+def show_plot(fig, key=None):
+    try:
+        st.plotly_chart(fig, width="stretch", key=key)
+    except Exception:
+        st.plotly_chart(fig, use_container_width=True, key=key)
+
+
+def is_numeric_col(series):
+    return (
+        pd.api.types.is_numeric_dtype(series)
+        and not pd.api.types.is_bool_dtype(series)
+    )
+
+
+def is_text_col(series):
+    return (
+        pd.api.types.is_object_dtype(series)
+        or pd.api.types.is_string_dtype(series)
+    ) and not pd.api.types.is_numeric_dtype(series)
+
+
+def numeric_columns(df):
+    return [c for c in df.columns if is_numeric_col(df[c])]
+
+
+def sample_for_plot(data, limit=MAX_PLOT_POINTS):
+    if len(data) > limit:
+        return data.sample(limit, random_state=42).sort_index(), True
+    return data, False
+
+
+def name_tokens(name):
+    """'roadID' / 'road_id' / 'Road ID' -> ['road', 'id']."""
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(name))
+    return [t for t in re.split(r"[^a-z0-9]+", spaced.lower()) if t]
+
+
+def compact_name(name):
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+def parse_datetime(series):
+    """Robust datetime parsing. Returns naive datetimes (UTC if tz-aware).
+
+    * numeric epoch seconds / milliseconds are recognised
+    * mixed date formats are handled (pandas 2 infers one format from the
+      first value, which silently turns the rest into NaT)
+    """
+    if pd.api.types.is_datetime64_any_dtype(series):
+        if getattr(series.dt, "tz", None) is not None:
+            return series.dt.tz_convert("UTC").dt.tz_localize(None)
+        return series
+
+    if is_numeric_col(series):
+        median = series.dropna().abs().median()
+        if pd.isna(median) or median < 1e8:
+            # Small numbers are not timestamps.
+            return pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+        unit = "ms" if median > 1e11 else "s"
+        return pd.to_datetime(series, unit=unit, errors="coerce")
+
+    def convert(**kwargs):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return pd.to_datetime(series, errors="coerce", utc=True, **kwargs)
+
+    parsed = convert()
+    present = int(series.notna().sum())
+
+    if present and (present - int(parsed.notna().sum())) / present > 0.05:
+        try:
+            alternative = convert(format="mixed")
+            if alternative.notna().sum() > parsed.notna().sum():
+                parsed = alternative
+        except (TypeError, ValueError):
+            pass
+
+    return parsed.dt.tz_localize(None)
+
+
+# =========================================================
+# COLUMN DETECTION (single system)
+# =========================================================
+
+def _numeric_ratio(series, sample=200):
+    values = series.dropna().head(sample)
+    if values.empty:
+        return 0.0
+    return float(pd.to_numeric(values, errors="coerce").notna().mean())
+
+
+def _datetime_ratio(series, sample=50):
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return 1.0
+    values = series.dropna().head(sample)
+    if values.empty:
+        return 0.0
+    return float(parse_datetime(values).notna().mean())
+
+
+def _plausible(series, field):
+    if field == "timestamp":
+        return _datetime_ratio(series) >= 0.8
+    if field in ("latitude", "longitude"):
+        return _numeric_ratio(series) >= 0.8
+    if field in ("speed", "volume"):
+        return _numeric_ratio(series) >= 0.5
+    return True
 
 
 def detect_columns(df):
-    """Automatically detect common transport-related columns."""
+    """Map transport fields to columns using names, then sanity-check values."""
     columns = list(df.columns)
-
-    timestamp = detect_column(
-        columns,
-        ["timestamp", "datetime", "date_time", "event_time",
-         "recorded_at", "time_stamp"]
-    )
-
-    date = timestamp or detect_column(
-        columns, ["date", "time"]
-    )
-
-    speed = detect_column(
-        columns,
-        ["speed", "velocity", "avg_speed", "average_speed"]
-    )
-
-    volume = detect_column(
-        columns,
-        ["traffic_volume", "vehicle_count", "vehicle_volume",
-         "traffic_count", "volume", "flow_count", "vehicles"]
-    )
-
-    latitude = detect_column(
-        columns, ["latitude", "lat"]
-    )
-
-    longitude = detect_column(
-        columns, ["longitude", "lon", "lng", "long"]
-    )
-
-    target = volume or speed
-
-    return {
-        "timestamp": date,
-        "speed": speed,
-        "volume": volume,
-        "latitude": latitude,
-        "longitude": longitude,
-        "target": target
-    }
-
-
-def save_history(action):
-    """Save a snapshot before changing the current dataset."""
-    if st.session_state.df is not None:
-        st.session_state.history.append({
-            "action": action,
-            "data": st.session_state.df.copy(deep=True)
-        })
-
-        # Keep memory use manageable.
-        st.session_state.history = st.session_state.history[-20:]
-
-
-def apply_numeric_conversion(df, columns):
-    for col in columns:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
-
-
-def valid_coordinates(df, lat_col, lon_col):
-    """Return rows with valid latitude and longitude."""
-    if not lat_col or not lon_col:
-        return pd.DataFrame()
-
-    if lat_col not in df.columns or lon_col not in df.columns:
-        return pd.DataFrame()
-
-    result = df.copy()
-
-    result[lat_col] = pd.to_numeric(result[lat_col], errors="coerce")
-    result[lon_col] = pd.to_numeric(result[lon_col], errors="coerce")
-
-    result = result.dropna(subset=[lat_col, lon_col])
-
-    result = result[
-        result[lat_col].between(-90, 90)
-        & result[lon_col].between(-180, 180)
-    ]
-
-    return result
-
-
-def convert_datetime(df, col):
-    df[col] = pd.to_datetime(df[col], errors="coerce")
-    return df
-
-
-def clean_numeric_column(series, method, lower=None, upper=None):
-    numeric = pd.to_numeric(series, errors="coerce")
-
-    if method == "Replace missing with median":
-        median = numeric.median()
-        if pd.notna(median):
-            numeric = numeric.fillna(median)
-
-    elif method == "Replace missing with mean":
-        mean = numeric.mean()
-        if pd.notna(mean):
-            numeric = numeric.fillna(mean)
-
-    elif method == "Replace missing with zero":
-        numeric = numeric.fillna(0)
-
-    elif method == "Remove outliers using IQR":
-        q1 = numeric.quantile(0.25)
-        q3 = numeric.quantile(0.75)
-        iqr = q3 - q1
-
-        if pd.notna(iqr):
-            lower_bound = q1 - 1.5 * iqr
-            upper_bound = q3 + 1.5 * iqr
-            numeric = numeric.where(
-                numeric.between(lower_bound, upper_bound)
-            )
-
-    elif method == "Clip to valid range":
-        if lower is not None:
-            numeric = numeric.clip(lower=lower)
-        if upper is not None:
-            numeric = numeric.clip(upper=upper)
-
-    return numeric
-
-
-# =========================================================
-# SIDEBAR
-# =========================================================
-
-st.sidebar.title("🚦 Mobility Studio")
-st.sidebar.caption("Smart Mobility Analytics Studio — V2")
-
-page = st.sidebar.radio(
-    "Navigation",
-    [
-        "Overview",
-        "Data Explorer",
-        "Data Cleaning",
-        "Transport Analysis",
-        "Interactive Map",
-        "Traffic Prediction",
-        "Export & History"
-    ]
-)
-
-st.sidebar.divider()
-st.sidebar.info(
-    "Upload a CSV dataset to begin. "
-    "Column detection is automatic where possible, "
-    "and you can override detected columns."
-)
-
-
-# =========================================================
-# DATA UPLOAD — CSV, XLSX AND ZIP SUPPORT
-# =========================================================
-
-st.title("Smart Mobility Analytics Studio")
-st.caption("Version 2.0 | Transportation Data Analytics & Machine Learning")
-
-uploaded_file = st.sidebar.file_uploader(
-    "Upload transportation data",
-    type=["csv", "xlsx", "zip"],
-    help="Upload a CSV, Excel workbook (.xlsx), or ZIP archive."
-)
-
-if uploaded_file is not None:
-    try:
-        file_bytes = uploaded_file.getvalue()
-        filename = uploaded_file.name.lower()
-
-        selected_file = uploaded_file.name
-        selected_sheet = None
-        data_bytes = file_bytes
-
-        # Handle ZIP archives containing CSV or Excel files
-        if filename.endswith(".zip"):
-            with zipfile.ZipFile(BytesIO(file_bytes)) as archive:
-                supported_files = [
-                    name for name in archive.namelist()
-                    if not name.endswith("/")
-                    and name.lower().endswith((".csv", ".xlsx"))
-                    and not name.startswith("__MACOSX/")
-                    and not name.split("/")[-1].startswith("~$")
-                    and not name.split("/")[-1].startswith("._")
-                ]
-
-                if not supported_files:
-                    st.error(
-                        "The ZIP archive contains no supported CSV or XLSX files."
-                    )
-                    st.stop()
-
-                selected_file = st.sidebar.selectbox(
-                    "Choose a file inside the ZIP",
-                    options=supported_files,
-                    key=f"zip_file_{uploaded_file.name}_{uploaded_file.size}"
-                )
-
-                data_bytes = archive.read(selected_file)
-
-        # Choose an Excel worksheet when needed
-        if selected_file.lower().endswith(".xlsx"):
-            excel_file = pd.ExcelFile(BytesIO(data_bytes), engine="openpyxl")
-
-            if not excel_file.sheet_names:
-                st.error("The Excel workbook contains no worksheets.")
-                st.stop()
-
-            selected_sheet = st.sidebar.selectbox(
-                "Choose an Excel worksheet",
-                options=excel_file.sheet_names,
-                key=(
-                    f"sheet_{uploaded_file.name}_"
-                    f"{uploaded_file.size}_{selected_file}"
-                )
-            )
-
-        # Identify the selected dataset, including ZIP member and worksheet
-        data_id = (
-            uploaded_file.name,
-            uploaded_file.size,
-            selected_file,
-            selected_sheet
-        )
-
-        # Load only when the selected dataset changes
-        if st.session_state.get("current_upload_id") != data_id:
-            if selected_file.lower().endswith(".csv"):
-                incoming_df = pd.read_csv(BytesIO(data_bytes))
-            else:
-                incoming_df = pd.read_excel(
-                    BytesIO(data_bytes),
-                    sheet_name=selected_sheet,
-                    engine="openpyxl"
-                )
-
-            if incoming_df.empty or len(incoming_df.columns) == 0:
-                st.error("The selected file contains no usable data.")
-                st.stop()
-
-            st.session_state.original_df = incoming_df.copy(deep=True)
-            st.session_state.df = incoming_df.copy(deep=True)
-            st.session_state.history = []
-            st.session_state.cleaning_log = []
-            st.session_state.uploaded_name = selected_file
-            st.session_state.current_upload_id = data_id
-
-            st.sidebar.success(
-                f"Loaded {len(incoming_df):,} rows successfully."
-            )
-
-    except zipfile.BadZipFile:
-        st.error("The uploaded ZIP file is invalid or corrupted.")
-        st.stop()
-
-    except Exception as exc:
-        st.error(f"Could not load the uploaded data: {exc}")
-        st.stop()
-
-df = st.session_state.df
-
-if df is None:
-    st.info("👈 Upload a CSV, XLSX, or ZIP file from the sidebar.")
-
-    st.markdown("### What V2 can do")
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.subheader("🧹 Data Quality")
-        st.write(
-            "Handle missing values, remove duplicates, "
-            "and undo cleaning operations."
-        )
-
-    with col2:
-        st.subheader("🗺️ Spatial Analytics")
-        st.write(
-            "Explore valid latitude and longitude records on a map."
-        )
-
-    with col3:
-        st.subheader("🤖 Machine Learning")
-        st.write(
-            "Train and evaluate traffic prediction models."
-        )
-
-    st.stop()
-
-    
-# =========================================================
-# PHASE 1 — SMART DATA INTELLIGENCE
-# Insert before: # COMMON DATA INFORMATION
-# =========================================================
-
-def sd_normalize_name(name):
-    """Normalize column names for matching."""
-    return re.sub(r"[^a-z0-9]+", "", str(name).lower())
-
-
-def sd_detect_columns(data):
-    """Identify common transport fields using names and aliases."""
-    aliases = {
-        "latitude": [
-            "latitude", "lat", "gpslatitude", "ycoordinate",
-            "coordy", "pointlatitude"
-        ],
-        "longitude": [
-            "longitude", "lon", "lng", "long", "gpslongitude",
-            "xcoordinate", "coordx", "pointlongitude"
-        ],
-        "timestamp": [
-            "timestamp", "datetime", "dateandtime", "eventtime",
-            "recordedat", "measurementtime", "datetimeutc"
-        ],
-        "speed": [
-            "speed", "speedkmh", "speedkph", "speedmph",
-            "vehiclespeed", "avgspeed", "averagespeed"
-        ],
-        "traffic_volume": [
-            "trafficvolume", "volume", "flow", "trafficflow",
-            "vehiclecount", "vehicles", "vehiclevolume",
-            "flowrate", "countvehicles"
-        ],
-        "road_id": [
-            "roadid", "roadidentifier", "roadcode", "segmentid",
-            "linkid", "streetid", "highwayid", "roadname",
-            "streetname", "segment", "road"
-        ],
-    }
-
-    normalized = {
-        column: sd_normalize_name(column)
-        for column in data.columns
-    }
+    compact = {c: compact_name(c) for c in columns}
+    tokens = {c: set(name_tokens(c)) for c in columns}
 
     detected = {}
+    used = set()
 
-    for field, candidates in aliases.items():
-        matches = [
-            column for column, normalized_name in normalized.items()
-            if normalized_name in candidates
-        ]
+    for field, rule in FIELD_RULES.items():
+        chosen = None
 
-        # Fallback to partial matching for common column-name variations.
-        if not matches:
-            for column, normalized_name in normalized.items():
-                if field == "latitude" and (
-                    normalized_name.endswith("latitude")
-                    or normalized_name == "lat"
-                ):
-                    matches.append(column)
-                elif field == "longitude" and (
-                    normalized_name.endswith("longitude")
-                    or normalized_name in ("lon", "lng", "long")
-                ):
-                    matches.append(column)
-                elif field == "timestamp" and any(
-                    word in normalized_name
-                    for word in ("timestamp", "datetime")
-                ):
-                    matches.append(column)
-                elif field == "speed" and "speed" in normalized_name:
-                    matches.append(column)
-                elif field == "traffic_volume" and any(
-                    word in normalized_name
-                    for word in ("trafficvolume", "vehiclecount", "trafficflow")
-                ):
-                    matches.append(column)
-                elif field == "road_id" and any(
-                    word in normalized_name
-                    for word in ("roadid", "segmentid", "linkid", "roadname")
-                ):
-                    matches.append(column)
+        for tier in ("exact", "contains", "tokens"):
+            hits = []
+            for col in columns:
+                if col in used or tokens[col] & rule["exclude"]:
+                    continue
 
-        if matches:
-            detected[field] = matches[0]
+                if tier == "exact":
+                    matched = compact[col] in rule["exact"]
+                elif tier == "contains":
+                    matched = any(k in compact[col] for k in rule["contains"])
+                else:
+                    matched = bool(tokens[col] & rule["tokens"])
+
+                if matched and _plausible(df[col], field):
+                    hits.append(col)
+
+            if hits:
+                # Prefer the dtype we expect for this field.
+                if field == "timestamp":
+                    hits.sort(key=lambda c: not pd.api.types.is_datetime64_any_dtype(df[c]))
+                elif field != "road_id":
+                    hits.sort(key=lambda c: not is_numeric_col(df[c]))
+                chosen = hits[0]
+                break
+
+        detected[field] = chosen
+        if chosen:
+            used.add(chosen)
 
     return detected
 
 
-def sd_outlier_mask(series):
+def column_mapping_ui(df):
+    """Sidebar widget: auto-detected mapping the user can override."""
+    auto = cached("auto_detect", lambda: detect_columns(df))
+    options = ["None"] + list(df.columns)
+    mapping = {}
+
+    with st.sidebar.expander("🔎 Column mapping", expanded=False):
+        st.caption(
+            "Detected from column names and values. "
+            "Change any field that is wrong; all pages use these choices."
+        )
+        for field, label in FIELD_LABELS.items():
+            default = auto.get(field)
+            index = options.index(default) if default in options else 0
+            choice = st.selectbox(
+                label,
+                options,
+                index=index,
+                key=f"map_{field}_{st.session_state.dataset_id}",
+            )
+            mapping[field] = None if choice == "None" else choice
+
+    return mapping
+
+
+def looks_like_identifier(series, name):
+    if set(name_tokens(name)) & ID_TOKENS:
+        return True
+    if (
+        pd.api.types.is_integer_dtype(series)
+        and len(series) >= 50
+        and series.nunique() / len(series) > 0.95
+    ):
+        return True
+    return False
+
+
+def identifier_columns(df, mapping):
+    """Columns that look like IDs (never filled, never used as features)."""
+    exclude = {mapping.get("speed"), mapping.get("volume")}
+
+    def compute():
+        return {
+            c for c in df.columns
+            if c not in exclude and looks_like_identifier(df[c], c)
+        }
+
+    return cached(
+        "identifier_columns", compute, mapping.get("speed"), mapping.get("volume")
+    )
+
+
+# =========================================================
+# DATA-QUALITY CHECKS (shared by profiling AND cleaning)
+# =========================================================
+
+def coordinate_invalid_mask(df, lat_col, lon_col):
+    """Rows where a coordinate is present but the pair is not usable.
+
+    Invalid = unparseable, out of range, only one of the two present,
+    or exactly (0, 0) which is almost always a GPS error.
     """
-    Find extreme numeric values using the IQR rule.
-    Returns a Boolean mask aligned with the original index.
-    """
-    values = pd.to_numeric(series, errors="coerce")
+    lat = pd.to_numeric(df[lat_col], errors="coerce")
+    lon = pd.to_numeric(df[lon_col], errors="coerce")
+
+    present = df[lat_col].notna() | df[lon_col].notna()
+    ok = (
+        lat.between(-90, 90)
+        & lon.between(-180, 180)
+        & ~((lat == 0) & (lon == 0))
+    )
+    return present & ~ok
+
+
+def iqr_outlier_mask(values):
     valid = values.dropna()
-
     if len(valid) < 8:
-        return pd.Series(False, index=series.index)
+        return pd.Series(False, index=values.index)
 
-    q1 = valid.quantile(0.25)
-    q3 = valid.quantile(0.75)
+    q1, q3 = valid.quantile(0.25), valid.quantile(0.75)
     iqr = q3 - q1
-
     if pd.isna(iqr) or iqr == 0:
-        return pd.Series(False, index=series.index)
+        return pd.Series(False, index=values.index)
 
-    lower = q1 - 1.5 * iqr
-    upper = q3 + 1.5 * iqr
-
-    return ((values < lower) | (values > upper)).fillna(False)
+    return (values < q1 - 1.5 * iqr) | (values > q3 + 1.5 * iqr)
 
 
-def sd_profile_data(data, detected):
-    """Profile the dataset and return quality findings."""
-    row_count, column_count = data.shape
-    total_cells = max(row_count * column_count, 1)
+def unusual_mask(series, kind):
+    """IQR outliers plus hard-impossible values for speed / volume."""
+    values = pd.to_numeric(series, errors="coerce")
+    mask = iqr_outlier_mask(values)
 
-    missing_cells = int(data.isna().sum().sum())
-    duplicate_rows = int(data.duplicated().sum())
+    if kind == "speed":
+        # 250 is a screening threshold, not a universal limit.
+        mask = mask | (values < 0) | (values > 250)
+    else:
+        mask = mask | (values < 0)
+
+    return mask.fillna(False)
+
+
+def column_profile(df):
+    return pd.DataFrame({
+        "Column": df.columns,
+        "Data type": [str(t) for t in df.dtypes],
+        "Missing": df.isna().sum().to_numpy(),
+        "Missing %": (df.isna().mean() * 100).round(2).to_numpy(),
+        "Unique": df.nunique(dropna=True).to_numpy(),
+    })
+
+
+def profile_data(df, mapping):
+    rows, cols = df.shape
+    missing_cells = int(df.isna().sum().sum())
+    duplicates = int(df.duplicated().sum())
 
     findings = {
-        "rows": row_count,
-        "columns": column_count,
+        "rows": rows,
+        "columns": cols,
         "missing_cells": missing_cells,
-        "missing_pct": missing_cells / total_cells * 100,
-        "duplicate_rows": duplicate_rows,
+        "missing_pct": missing_cells / max(rows * cols, 1) * 100,
+        "duplicate_rows": duplicates,
         "invalid_coordinates": 0,
         "invalid_timestamps": 0,
         "unusual_speed": 0,
         "unusual_volume": 0,
-        "coordinate_rows_checked": 0,
-        "timestamp_rows_checked": 0,
     }
 
-    # Validate geographic coordinates when both fields are available.
-    lat_col = detected.get("latitude")
-    lon_col = detected.get("longitude")
-
+    lat_col, lon_col = mapping.get("latitude"), mapping.get("longitude")
     if lat_col and lon_col:
-        lat = pd.to_numeric(data[lat_col], errors="coerce")
-        lon = pd.to_numeric(data[lon_col], errors="coerce")
-
-        has_both = data[lat_col].notna() & data[lon_col].notna()
-        findings["coordinate_rows_checked"] = int(has_both.sum())
-
-        invalid = (
-            has_both
-            & (
-                lat.isna()
-                | lon.isna()
-                | ~lat.between(-90, 90)
-                | ~lon.between(-180, 180)
-            )
+        findings["invalid_coordinates"] = int(
+            coordinate_invalid_mask(df, lat_col, lon_col).sum()
         )
 
-        # A coordinate pair that cannot be converted is invalid too.
-        findings["invalid_coordinates"] = int(invalid.sum())
-
-    # Check whether timestamp values can be parsed.
-    time_col = detected.get("timestamp")
-
-    if time_col:
-        present = data[time_col].notna()
-        findings["timestamp_rows_checked"] = int(present.sum())
-
+    ts_col = mapping.get("timestamp")
+    if ts_col:
+        present = df[ts_col].notna()
         if present.any():
-            parsed = pd.to_datetime(
-                data.loc[present, time_col],
-                errors="coerce",
-                utc=True
-            )
+            parsed = parse_datetime(df.loc[present, ts_col])
             findings["invalid_timestamps"] = int(parsed.isna().sum())
 
-    # Check speed and traffic-volume columns.
-    speed_col = detected.get("speed")
-
-    if speed_col:
-        speed = pd.to_numeric(data[speed_col], errors="coerce")
-        speed_outliers = sd_outlier_mask(data[speed_col])
-
-        # Negative speeds and values over 250 are suspicious.
-        # The upper threshold is a screening rule, not a universal law.
-        hard_invalid = (speed < 0) | (speed > 250)
-
+    if mapping.get("speed"):
         findings["unusual_speed"] = int(
-            (speed_outliers | hard_invalid.fillna(False)).sum()
+            unusual_mask(df[mapping["speed"]], "speed").sum()
         )
-
-    volume_col = detected.get("traffic_volume")
-
-    if volume_col:
-        volume = pd.to_numeric(data[volume_col], errors="coerce")
-        volume_outliers = sd_outlier_mask(data[volume_col])
-        hard_invalid = volume < 0
-
+    if mapping.get("volume"):
         findings["unusual_volume"] = int(
-            (volume_outliers | hard_invalid.fillna(False)).sum()
+            unusual_mask(df[mapping["volume"]], "volume").sum()
         )
 
-    # Transparent heuristic score: a screening indicator, not a standard.
-    row_denominator = max(row_count, 1)
-    missing_penalty = min(findings["missing_pct"] * 0.35, 35)
-    duplicate_penalty = min(
-        findings["duplicate_rows"] / row_denominator * 100 * 0.20, 20
+    denom = max(rows, 1)
+    penalty = (
+        min(findings["missing_pct"] * 0.35, 35)
+        + min(duplicates / denom * 100 * 0.20, 20)
+        + min(findings["invalid_coordinates"] / denom * 100 * 0.20, 20)
+        + min(findings["invalid_timestamps"] / denom * 100 * 0.10, 10)
+        + min(
+            (findings["unusual_speed"] + findings["unusual_volume"])
+            / denom * 100 * 0.15,
+            15,
+        )
     )
-    coordinate_penalty = min(
-        findings["invalid_coordinates"] / row_denominator * 100 * 0.20, 20
-    )
-    timestamp_penalty = min(
-        findings["invalid_timestamps"] / row_denominator * 100 * 0.10, 10
-    )
-    unusual_penalty = min(
-        (
-            findings["unusual_speed"] + findings["unusual_volume"]
-        ) / row_denominator * 100 * 0.15,
-        15
-    )
-
-    findings["quality_score"] = round(max(
-        0,
-        100
-        - missing_penalty
-        - duplicate_penalty
-        - coordinate_penalty
-        - timestamp_penalty
-        - unusual_penalty
-    ))
-
+    findings["quality_score"] = round(max(0, 100 - penalty))
     return findings
 
 
-# ---------------------------------------------------------
-# DATA INTELLIGENCE DASHBOARD
-# ---------------------------------------------------------
-
-st.header("Smart Data Intelligence")
-st.caption(
-    "Automatically profile transport data, identify potential issues, "
-    "and choose which cleaning actions to apply."
-)
-
-sd_df = st.session_state.df
-
-if sd_df is None or sd_df.empty:
-    st.info("Upload a dataset to run Smart Data Intelligence.")
-else:
-    sd_detected = sd_detect_columns(sd_df)
-
-    # Use the full dataset for counts, but a small sample for preview.
-    sd_sample_size = min(len(sd_df), 5000)
-    sd_sample = sd_df.head(sd_sample_size)
-
-    with st.spinner("Profiling dataset and checking data quality..."):
-        sd_findings = sd_profile_data(sd_df, sd_detected)
-
-    sd_score = sd_findings["quality_score"]
-
-    if sd_score >= 90:
-        sd_score_label = "Good"
-    elif sd_score >= 70:
-        sd_score_label = "Needs attention"
-    else:
-        sd_score_label = "Poor"
-
-    sd_col1, sd_col2, sd_col3, sd_col4 = st.columns(4)
-
-    sd_col1.metric("Data quality score", f"{sd_score}/100", sd_score_label)
-    sd_col2.metric("Rows", f"{len(sd_df):,}")
-    sd_col3.metric("Columns", f"{len(sd_df.columns):,}")
-    sd_col4.metric(
-        "Missing cells",
-        f"{sd_findings['missing_cells']:,}",
-        f"{sd_findings['missing_pct']:.1f}% of all cells"
-    )
-
-    st.caption(
-        "The score is a transparent heuristic for prioritizing data checks. "
-        "It is not a certified data-quality standard."
-    )
-
-    # Field detection results.
-    with st.expander("🔎 Detected transportation fields", expanded=True):
-        sd_fields = [
-            ("Latitude", "latitude"),
-            ("Longitude", "longitude"),
-            ("Timestamp", "timestamp"),
-            ("Speed", "speed"),
-            ("Traffic volume", "traffic_volume"),
-            ("Road / segment identifier", "road_id"),
-        ]
-
-        sd_field_col1, sd_field_col2 = st.columns(2)
-
-        for index, (label, field) in enumerate(sd_fields):
-            target_col = sd_field_col1 if index % 2 == 0 else sd_field_col2
-
-            with target_col:
-                detected_column = sd_detected.get(field)
-
-                if detected_column:
-                    st.success(f"**{label}:** `{detected_column}`")
-                else:
-                    st.warning(f"**{label}:** Not detected")
-
-        if sd_detected:
-            st.caption(
-                "Detection is based primarily on column names. "
-                "Check the matches before relying on the results."
-            )
-
-    # Data quality findings.
-    with st.expander("🩺 Data-quality findings", expanded=True):
-        sd_issue_rows = [
-            ("Missing cells", sd_findings["missing_cells"],
-             "Review affected columns; choose whether to fill missing values."),
-            ("Duplicate rows", sd_findings["duplicate_rows"],
-             "Remove exact duplicate rows if they are accidental."),
-            ("Invalid coordinate pairs", sd_findings["invalid_coordinates"],
-             "Check latitude/longitude ranges and coordinate formats."),
-            ("Unparseable timestamps", sd_findings["invalid_timestamps"],
-             "Review date formats and timezone assumptions."),
-            ("Unusual speed values", sd_findings["unusual_speed"],
-             "Check units, sensor errors, and possible legitimate extremes."),
-            ("Unusual traffic-volume values", sd_findings["unusual_volume"],
-             "Check negative counts, measurement intervals, and extreme values."),
-        ]
-
-        sd_any_issue = False
-
-        for issue_name, issue_count, explanation in sd_issue_rows:
-            if issue_count > 0:
-                sd_any_issue = True
-                st.warning(
-                    f"**{issue_name}: {issue_count:,}** — {explanation}"
-                )
-
-        if not sd_any_issue:
-            st.success(
-                "No issues were detected by the current checks. "
-                "This does not guarantee the dataset is error-free."
-            )
-
-        if not sd_detected.get("latitude") or not sd_detected.get("longitude"):
-            st.info(
-                "Coordinate validation is unavailable until both latitude "
-                "and longitude fields are identified."
-            )
-
-    # Missing-value breakdown.
-    with st.expander("📋 Column-level data profile"):
-        sd_profile_table = pd.DataFrame({
-            "Column": sd_df.columns,
-            "Data type": [str(dtype) for dtype in sd_df.dtypes],
-            "Missing values": [
-                int(sd_df[col].isna().sum()) for col in sd_df.columns
-            ],
-            "Missing %": [
-                round(sd_df[col].isna().mean() * 100, 2)
-                for col in sd_df.columns
-            ],
-            "Unique values": [
-                int(sd_df[col].nunique(dropna=True))
-                for col in sd_df.columns
-            ],
-        })
-
-        st.dataframe(sd_profile_table, use_container_width=True)
-
-        st.caption(
-            f"Previewing the first {len(sd_sample):,} of "
-            f"{len(sd_df):,} records below."
-        )
-        st.dataframe(sd_sample, use_container_width=True)
-
-    # Recommend cleaning actions; changes only occur after approval.
-    st.subheader("🧹 Recommended cleaning actions")
-    st.write(
-        "Select the actions you want to apply. Review the description "
-        "before approving changes."
-    )
-
-    sd_actions = {}
-
-    sd_actions["duplicates"] = st.checkbox(
-        f"Remove exact duplicate rows ({sd_findings['duplicate_rows']:,})",
-        value=False,
-        disabled=sd_findings["duplicate_rows"] == 0,
-        key="sd_action_duplicates"
-    )
-
-    sd_actions["coordinates"] = st.checkbox(
-        "Set invalid latitude/longitude pairs to missing values",
-        value=False,
-        disabled=(
-            not sd_detected.get("latitude")
-            or not sd_detected.get("longitude")
-            or sd_findings["invalid_coordinates"] == 0
-        ),
-        key="sd_action_coordinates"
-    )
-
-    sd_actions["missing"] = st.checkbox(
-        "Fill missing values in eligible columns "
-        "(numeric: median; text: most frequent value)",
-        value=False,
-        disabled=sd_findings["missing_cells"] == 0,
-        key="sd_action_missing"
-    )
-
-    sd_actions["outliers"] = st.checkbox(
-        "Set unusual speed and traffic-volume measurements to missing",
-        value=False,
-        disabled=(
-            not sd_detected.get("speed")
-            and not sd_detected.get("traffic_volume")
-        ),
-        key="sd_action_outliers"
-    )
-
-    st.caption(
-        "Missing-value filling skips detected coordinates, timestamps, "
-        "and road identifiers. Outliers are flagged using statistical "
-        "rules and may be legitimate observations."
-    )
-
-    sd_selected_actions = [
-        name for name, selected in sd_actions.items() if selected
-    ]
-
-    if st.button(
-        "✅ Approve and apply selected cleaning actions",
-        type="primary",
-        disabled=len(sd_selected_actions) == 0,
-        key="sd_apply_cleaning"
-    ):
-        # Create a working copy only after the user approves.
-        sd_cleaned = st.session_state.df.copy(deep=True)
-        sd_change_log = []
-
-        try:
-            # 1. Remove exact duplicate rows.
-            if sd_actions["duplicates"]:
-                before_rows = len(sd_cleaned)
-                sd_cleaned = sd_cleaned.drop_duplicates()
-                removed = before_rows - len(sd_cleaned)
-
-                sd_change_log.append(
-                    f"Removed {removed:,} exact duplicate rows."
-                )
-
-            # 2. Mark invalid coordinate pairs as missing.
-            if sd_actions["coordinates"]:
-                lat_col = sd_detected["latitude"]
-                lon_col = sd_detected["longitude"]
-
-                lat = pd.to_numeric(sd_cleaned[lat_col], errors="coerce")
-                lon = pd.to_numeric(sd_cleaned[lon_col], errors="coerce")
-
-                # Missing coordinates stay missing; invalid values are
-                # converted to NaN, not replaced with guessed locations.
-                invalid_lat = lat.notna() & ~lat.between(-90, 90)
-                invalid_lon = lon.notna() & ~lon.between(-180, 180)
-
-                sd_cleaned.loc[invalid_lat, lat_col] = np.nan
-                sd_cleaned.loc[invalid_lon, lon_col] = np.nan
-
-                sd_change_log.append(
-                    "Set out-of-range latitude/longitude values to missing."
-                )
-
-            # 3. Fill eligible missing values.
-            if sd_actions["missing"]:
-                protected_fields = {
-                    sd_detected.get("latitude"),
-                    sd_detected.get("longitude"),
-                    sd_detected.get("timestamp"),
-                    sd_detected.get("road_id"),
-                }
-                protected_fields.discard(None)
-
-                filled_columns = []
-
-                for column in sd_cleaned.columns:
-                    if column in protected_fields:
-                        continue
-
-                    missing_mask = sd_cleaned[column].isna()
-
-                    if not missing_mask.any():
-                        continue
-
-                    if pd.api.types.is_numeric_dtype(sd_cleaned[column]):
-                        median_value = sd_cleaned[column].median()
-
-                        if pd.notna(median_value):
-                            sd_cleaned[column] = sd_cleaned[column].fillna(
-                                median_value
-                            )
-                            filled_columns.append(str(column))
-
-                    else:
-                        modes = sd_cleaned[column].mode(dropna=True)
-
-                        if not modes.empty:
-                            sd_cleaned[column] = sd_cleaned[column].fillna(
-                                modes.iloc[0]
-                            )
-                            filled_columns.append(str(column))
-
-                sd_change_log.append(
-                    "Filled eligible columns: "
-                    + (
-                        ", ".join(filled_columns)
-                        if filled_columns
-                        else "no eligible columns required filling"
-                    )
-                )
-
-            # 4. Mark suspicious speed/volume values as missing.
-            if sd_actions["outliers"]:
-                outlier_columns = [
-                    sd_detected.get("speed"),
-                    sd_detected.get("traffic_volume"),
-                ]
-
-                changed = []
-
-                for column in outlier_columns:
-                    if column is None:
-                        continue
-
-                    numeric_values = pd.to_numeric(
-                        sd_cleaned[column], errors="coerce"
-                    )
-
-                    mask = sd_outlier_mask(sd_cleaned[column])
-
-                    if column == sd_detected.get("speed"):
-                        mask = mask | (
-                            (numeric_values < 0) | (numeric_values > 250)
-                        ).fillna(False)
-
-                    if column == sd_detected.get("traffic_volume"):
-                        mask = mask | (numeric_values < 0).fillna(False)
-
-                    count = int(mask.sum())
-
-                    if count:
-                        sd_cleaned.loc[mask, column] = np.nan
-                        changed.append(f"{column}: {count:,} values")
-
-                sd_change_log.append(
-                    "Marked unusual measurements as missing: "
-                    + (
-                        "; ".join(changed)
-                        if changed
-                        else "no unusual values found"
-                    )
-                )
-
-            # Save a snapshot only when the user approves modifications.
-            if not sd_cleaned.equals(st.session_state.df):
-                if "history" not in st.session_state:
-                    st.session_state.history = []
-
-                st.session_state.history.append(
-                    st.session_state.df.copy(deep=True)
-                )
-
-                # Keep memory use bounded for undo history.
-                st.session_state.history = st.session_state.history[-5:]
-
-                st.session_state.df = sd_cleaned
-
-                if "cleaning_log" not in st.session_state:
-                    st.session_state.cleaning_log = []
-
-                st.session_state.cleaning_log.extend(sd_change_log)
-
-                st.success("Selected cleaning actions applied.")
-                for item in sd_change_log:
-                    st.write(f"- {item}")
-
-                st.rerun()
+def fill_candidates(df, mapping):
+    """Split columns with missing values into fillable vs skipped (+reason)."""
+    protected = {
+        mapping.get(k) for k in ("latitude", "longitude", "timestamp", "road_id")
+    } - {None}
+    ids = identifier_columns(df, mapping)
+
+    eligible, skipped = [], []
+    for col in df.columns:
+        share = df[col].isna().mean()
+        if share == 0:
+            continue
+        if col in protected:
+            skipped.append((col, "mapped coordinate/time/road field"))
+        elif col in ids:
+            skipped.append((col, "looks like an identifier"))
+        elif pd.api.types.is_datetime64_any_dtype(df[col]):
+            skipped.append((col, "datetime column"))
+        elif share > 0.5:
+            skipped.append((col, "more than 50% missing"))
+        else:
+            eligible.append(col)
+    return eligible, skipped
+
+
+def run_smart_cleaning(df, actions, mapping):
+    """Apply the approved smart-cleaning actions to a copy of df.
+
+    Returns (cleaned_df, log_entries, total_changes).
+    """
+    work = df.copy(deep=True)
+    entries = []
+    changes = 0
+
+    if actions.get("duplicates"):
+        before = len(work)
+        work = work.drop_duplicates()
+        removed = before - len(work)
+        changes += removed
+        entries.append(make_log_entry(
+            "Smart: remove duplicate rows", "(all)", before, work,
+            f"Removed {removed:,} exact duplicate rows"))
+
+    if actions.get("coordinates"):
+        lat_col, lon_col = mapping["latitude"], mapping["longitude"]
+        bad = coordinate_invalid_mask(work, lat_col, lon_col)
+        count = int(bad.sum())
+        if count:
+            work[lat_col] = pd.to_numeric(work[lat_col], errors="coerce").mask(bad)
+            work[lon_col] = pd.to_numeric(work[lon_col], errors="coerce").mask(bad)
+        changes += count
+        entries.append(make_log_entry(
+            "Smart: invalid coordinates", f"{lat_col}, {lon_col}", len(work), work,
+            f"Set {count:,} invalid coordinate pairs to missing"))
+
+    if actions.get("missing"):
+        eligible, _ = fill_candidates(work, mapping)
+        filled = []
+        for col in eligible:
+            n_missing = int(work[col].isna().sum())
+            if is_numeric_col(work[col]):
+                value = work[col].median()
             else:
-                st.info("No data changes were necessary.")
+                modes = work[col].mode(dropna=True)
+                value = modes.iloc[0] if not modes.empty else np.nan
 
-        except Exception as exc:
-            st.error(f"Cleaning could not be completed: {exc}")
+            if pd.notna(value):
+                work[col] = work[col].fillna(value)
+                filled.append(f"{col} ({n_missing:,})")
+                changes += n_missing
 
-    # Efficient processing note.
-    if len(sd_df) > 100_000:
-        st.info(
-            "Large dataset detected. Profiling uses full-data quality counts, "
-            "while the preview is limited to 5,000 rows. For very large files, "
-            "consider Parquet, chunked CSV processing, or a database backend."
-        )
+        entries.append(make_log_entry(
+            "Smart: fill missing values", "multiple", len(work), work,
+            "Filled: " + (", ".join(filled) if filled else "nothing eligible")))
 
-# Refresh the reference for the rest of the existing app.
-df = st.session_state.df
+    if actions.get("outliers"):
+        changed = []
+        for kind in ("speed", "volume"):
+            col = mapping.get(kind)
+            if not col:
+                continue
+            mask = unusual_mask(work[col], kind)
+            count = int(mask.sum())
+            if count:
+                work[col] = pd.to_numeric(work[col], errors="coerce").mask(mask)
+                changed.append(f"{col}: {count:,}")
+                changes += count
 
+        entries.append(make_log_entry(
+            "Smart: unusual measurements", "speed / volume", len(work), work,
+            "Set to missing — " + ("; ".join(changed) if changed else "none found")))
+
+    return work, entries, changes
 
 
 # =========================================================
-# COMMON DATA INFORMATION
+# FILE LOADING
 # =========================================================
 
-detected = detect_columns(df)
+@st.cache_data(show_spinner=False, max_entries=4)
+def list_zip_members(_file_bytes, file_key):
+    with zipfile.ZipFile(BytesIO(_file_bytes)) as archive:
+        return [
+            name for name in archive.namelist()
+            if not name.endswith("/")
+            and name.lower().endswith((".csv", ".xlsx"))
+            and not name.startswith("__MACOSX/")
+            and not name.split("/")[-1].startswith(("~$", "._"))
+        ]
 
-numeric_columns = df.select_dtypes(include=np.number).columns.tolist()
 
-st.sidebar.markdown("### Dataset")
-st.sidebar.write(f"**File:** {st.session_state.uploaded_name}")
-st.sidebar.write(f"**Rows:** {len(df):,}")
-st.sidebar.write(f"**Columns:** {len(df.columns)}")
+def extract_bytes(file_bytes, filename, member):
+    if filename.lower().endswith(".zip") and member:
+        with zipfile.ZipFile(BytesIO(file_bytes)) as archive:
+            return archive.read(member)
+    return file_bytes
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def list_excel_sheets(_file_bytes, file_key, member):
+    data = extract_bytes(_file_bytes, file_key[0], member)
+    return pd.ExcelFile(BytesIO(data), engine="openpyxl").sheet_names
+
+
+def read_csv_bytes(data):
+    for encoding in ("utf-8-sig", "latin-1"):
+        try:
+            frame = pd.read_csv(BytesIO(data), encoding=encoding, low_memory=False)
+            if frame.shape[1] == 1:
+                # Probably a ';' or tab separated file.
+                try:
+                    guessed = pd.read_csv(
+                        BytesIO(data), encoding=encoding, sep=None, engine="python"
+                    )
+                    if guessed.shape[1] > 1:
+                        frame = guessed
+                except Exception:
+                    pass
+            return frame
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("The file encoding could not be read.")
+
+
+def read_dataset(file_bytes, filename, member, sheet):
+    data = extract_bytes(file_bytes, filename, member)
+    inner = (member or filename).lower()
+    if inner.endswith(".csv"):
+        return read_csv_bytes(data)
+    return pd.read_excel(BytesIO(data), sheet_name=sheet, engine="openpyxl")
 
 
 # =========================================================
-# OVERVIEW
+# PAGES
 # =========================================================
 
-if page == "Overview":
+def page_overview(df, m):
     st.header("Dashboard Overview")
 
+    missing_total = cached("missing_total", lambda: int(df.isna().sum().sum()))
+    duplicates = cached("duplicates", lambda: int(df.duplicated().sum()))
+
     c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total records", f"{len(df):,}")
+    c2.metric("Total columns", f"{len(df.columns):,}")
+    c3.metric("Missing cells", f"{missing_total:,}")
+    c4.metric("Duplicate rows", f"{duplicates:,}")
 
-    c1.metric("Total Records", f"{len(df):,}")
-    c2.metric("Total Columns", len(df.columns))
-    c3.metric("Missing Cells", f"{int(df.isna().sum().sum()):,}")
-    c4.metric("Duplicate Rows", f"{int(df.duplicated().sum()):,}")
+    st.subheader("Mapped transportation fields")
+    show_df(
+        pd.DataFrame({
+            "Field": list(FIELD_LABELS.values()),
+            "Column": [m[f] or "Not mapped" for f in FIELD_LABELS],
+        }),
+        hide_index=True,
+    )
+    st.caption("Wrong or missing? Change it in the sidebar under **Column mapping**.")
 
-    st.subheader("Detected Transportation Fields")
+    st.subheader("Dataset preview")
+    show_df(df.head(20))
 
-    detected_df = pd.DataFrame({
-        "Field": list(detected.keys()),
-        "Detected Column": [
-            str(value) if value is not None else "Not detected"
-            for value in detected.values()
-        ]
-    })
+    profile = cached("column_profile", lambda: column_profile(df))
 
-    st.dataframe(detected_df, use_container_width=True, hide_index=True)
+    st.subheader("Columns")
+    show_df(profile, hide_index=True)
 
-    st.subheader("Dataset Preview")
-    st.dataframe(df.head(20), use_container_width=True)
+    st.subheader("Missing values by column")
+    missing = profile[profile["Missing"] > 0]
+    if missing.empty:
+        st.success("No missing values detected.")
+    else:
+        show_plot(px.bar(
+            missing, x="Column", y="Missing %", hover_data=["Missing"],
+            title="Share of missing values by column (%)"))
 
-    st.subheader("Data Types")
-    dtype_df = pd.DataFrame({
-        "Column": df.columns,
-        "Data Type": [str(df[col].dtype) for col in df.columns],
-        "Missing Values": [int(df[col].isna().sum()) for col in df.columns],
-        "Unique Values": [int(df[col].nunique(dropna=True)) for col in df.columns]
-    })
 
-    st.dataframe(dtype_df, use_container_width=True, hide_index=True)
-
-    st.subheader("Missing Values by Column")
-
-    missing_df = (
-        df.isna()
-        .sum()
-        .rename("Missing Values")
-        .reset_index()
-        .rename(columns={"index": "Column"})
+def page_intelligence(df, m):
+    st.header("Smart Data Intelligence")
+    st.caption(
+        "Profiles the dataset, flags likely problems and lets you choose "
+        "which cleaning actions to apply. Nothing changes until you approve."
     )
 
-    missing_df = missing_df[missing_df["Missing Values"] > 0]
+    mapping_key = tuple(m.items())
+    with st.spinner("Profiling dataset..."):
+        findings = cached("profile", lambda: profile_data(df, m), mapping_key)
 
-    if not missing_df.empty:
-        fig = px.bar(
-            missing_df,
-            x="Column",
-            y="Missing Values",
-            title="Missing Data Overview"
+    score = findings["quality_score"]
+    label = "Good" if score >= 90 else "Needs attention" if score >= 70 else "Poor"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Data quality score", f"{score}/100", label)
+    c2.metric("Rows", f"{findings['rows']:,}")
+    c3.metric("Columns", f"{findings['columns']:,}")
+    c4.metric(
+        "Missing cells",
+        f"{findings['missing_cells']:,}",
+        f"{findings['missing_pct']:.1f}% of all cells",
+    )
+    st.caption(
+        "The score is a heuristic for prioritising checks, "
+        "not a certified data-quality standard."
+    )
+
+    with st.expander("🩺 Data-quality findings", expanded=True):
+        issues = [
+            ("Missing cells", findings["missing_cells"],
+             "Review affected columns and decide whether to fill them."),
+            ("Duplicate rows", findings["duplicate_rows"],
+             "Remove exact duplicates if they are accidental."),
+            ("Invalid coordinate pairs", findings["invalid_coordinates"],
+             "Out of range, unparseable, half-missing, or exactly (0, 0)."),
+            ("Unparseable timestamps", findings["invalid_timestamps"],
+             "Check date formats and timezone assumptions."),
+            ("Unusual speed values", findings["unusual_speed"],
+             "Check units, sensor errors and legitimate extremes."),
+            ("Unusual traffic-volume values", findings["unusual_volume"],
+             "Check negative counts, measurement intervals and peaks."),
+        ]
+        any_issue = False
+        for name, count, advice in issues:
+            if count > 0:
+                any_issue = True
+                st.warning(f"**{name}: {count:,}** — {advice}")
+        if not any_issue:
+            st.success(
+                "No issues found by the current checks "
+                "(this does not guarantee the data is error-free)."
+            )
+
+        if not (m["latitude"] and m["longitude"]):
+            st.info("Coordinate checks need both latitude and longitude mapped.")
+        if not m["timestamp"]:
+            st.info("Timestamp checks need a timestamp column mapped.")
+
+    with st.expander("📋 Column-level profile"):
+        show_df(cached("column_profile", lambda: column_profile(df)), hide_index=True)
+
+    st.subheader("🧹 Recommended cleaning actions")
+
+    eligible, skipped = fill_candidates(df, m)
+    has_coords = bool(m["latitude"] and m["longitude"])
+
+    actions = {
+        "duplicates": st.checkbox(
+            f"Remove exact duplicate rows ({findings['duplicate_rows']:,})",
+            disabled=findings["duplicate_rows"] == 0,
+            key="sd_dups",
+        ),
+        "coordinates": st.checkbox(
+            f"Set invalid latitude/longitude pairs to missing "
+            f"({findings['invalid_coordinates']:,})",
+            disabled=not has_coords or findings["invalid_coordinates"] == 0,
+            key="sd_coords",
+        ),
+        "missing": st.checkbox(
+            f"Fill missing values in {len(eligible)} eligible column(s) "
+            "(numeric: median; text: most frequent value)",
+            disabled=not eligible,
+            key="sd_missing",
+        ),
+        "outliers": st.checkbox(
+            "Set unusual speed / traffic-volume values to missing "
+            f"({findings['unusual_speed'] + findings['unusual_volume']:,})",
+            disabled=(findings["unusual_speed"] + findings["unusual_volume"]) == 0,
+            key="sd_outliers",
+        ),
+    }
+
+    if skipped:
+        with st.expander("Columns skipped by 'fill missing values'"):
+            show_df(
+                pd.DataFrame(skipped, columns=["Column", "Reason"]),
+                hide_index=True,
+            )
+    st.caption(
+        "Outliers are found with statistical rules and may be real "
+        "observations (e.g. rush-hour peaks). Review before approving."
+    )
+
+    selected = [name for name, on in actions.items() if on]
+
+    if st.button(
+        "✅ Approve and apply selected actions",
+        type="primary",
+        disabled=not selected,
+        key="sd_apply",
+    ):
+        try:
+            cleaned, entries, changes = run_smart_cleaning(df, actions, m)
+        except Exception as exc:
+            st.error(f"Cleaning could not be completed: {exc}")
+            return
+
+        if changes == 0:
+            st.info("No data changes were necessary.")
+        else:
+            push_history("Smart cleaning: " + ", ".join(selected))
+            st.session_state.cleaning_log.extend(entries)
+            set_df(cleaned)
+            set_flash(
+                "success",
+                "Applied:\n" + "\n".join(f"- {e['details']}" for e in entries),
+            )
+            st.rerun()
+
+    if len(df) > 100_000:
+        st.info(
+            "Large dataset: results are cached per dataset version. For very "
+            "large files consider Parquet, chunked reading or a database."
         )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.success("No missing values detected.")
 
 
-# =========================================================
-# DATA EXPLORER
-# =========================================================
-
-elif page == "Data Explorer":
+def page_explorer(df, m):
     st.header("Data Explorer")
 
     st.subheader("Preview")
-    st.dataframe(df, use_container_width=True)
+    n_rows = st.number_input(
+        "Rows to preview", min_value=10, max_value=5000, value=100, step=10)
+    show_df(df.head(int(n_rows)))
+    st.caption(f"Showing up to {int(n_rows):,} of {len(df):,} rows.")
 
-    st.subheader("Column Statistics")
+    st.subheader("Column statistics")
+    column = st.selectbox("Select a column", list(df.columns))
+    series = df[column]
 
-    selected_column = st.selectbox(
-        "Select a column",
-        options=list(df.columns)
-    )
+    a, b, c = st.columns(3)
+    a.metric("Data type", str(series.dtype))
+    b.metric("Missing values", f"{int(series.isna().sum()):,}")
+    c.metric("Unique values", f"{int(series.nunique(dropna=True)):,}")
 
-    selected_series = df[selected_column]
-
-    st.write("**Data type:**", str(selected_series.dtype))
-    st.write("**Missing values:**", int(selected_series.isna().sum()))
-    st.write("**Unique values:**", int(selected_series.nunique(dropna=True)))
-
-    if pd.api.types.is_numeric_dtype(selected_series):
-        st.dataframe(
-            selected_series.describe().to_frame("Statistics"),
-            use_container_width=True
-        )
-
-        fig = px.histogram(
-            df,
-            x=selected_column,
-            title=f"Distribution of {selected_column}"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
+    if is_numeric_col(series):
+        show_df(series.describe().to_frame("Statistics"))
+        plot_data, sampled = sample_for_plot(series.dropna().to_frame())
+        show_plot(px.histogram(plot_data, x=column, title=f"Distribution of {column}"))
+        if sampled:
+            st.caption(f"Histogram uses a random sample of {MAX_PLOT_POINTS:,} values.")
     else:
-        value_counts = (
-            selected_series.astype("string")
-            .fillna("(Missing)")
-            .value_counts()
-            .head(30)
-            .rename_axis("Value")
-            .reset_index(name="Count")
+        counts = (
+            series.astype("string").fillna("(Missing)")
+            .value_counts().head(30)
+            .rename_axis("Value").reset_index(name="Count")
         )
+        show_df(counts, hide_index=True)
+        if not counts.empty:
+            show_plot(px.bar(counts, x="Value", y="Count", title=f"Top values: {column}"))
 
-        st.dataframe(value_counts, use_container_width=True)
-
-        if not value_counts.empty:
-            fig = px.bar(
-                value_counts,
-                x="Value",
-                y="Count",
-                title=f"Top Values: {selected_column}"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("Create a Custom Chart")
-
-    if len(numeric_columns) >= 1:
-        x_options = list(df.columns)
-        x_col = st.selectbox("X-axis", x_options, key="explorer_x")
-        y_col = st.selectbox(
-            "Numeric Y-axis",
-            numeric_columns,
-            key="explorer_y"
-        )
-
-        chart_type = st.selectbox(
-            "Chart type",
-            ["Scatter", "Line", "Bar"]
-        )
-
-        try:
-            if chart_type == "Scatter":
-                fig = px.scatter(df, x=x_col, y=y_col)
-            elif chart_type == "Line":
-                fig = px.line(df, x=x_col, y=y_col)
-            else:
-                fig = px.bar(df, x=x_col, y=y_col)
-
-            st.plotly_chart(fig, use_container_width=True)
-
-        except Exception as exc:
-            st.warning(f"Could not create this chart: {exc}")
-    else:
+    st.subheader("Custom chart")
+    numbers = numeric_columns(df)
+    if not numbers:
         st.info("No numeric columns are available for charting.")
+        return
+
+    chart_type = st.selectbox(
+        "Chart type",
+        ["Scatter", "Line", "Bar (mean of Y by X)", "Box", "Histogram"],
+    )
+    x_col = st.selectbox("X-axis", list(df.columns), key="explorer_x")
+    y_col = None
+    if chart_type != "Histogram":
+        y_col = st.selectbox("Numeric Y-axis", numbers, key="explorer_y")
+
+    try:
+        cols = [x_col] + ([y_col] if y_col and y_col != x_col else [])
+        data = df[cols].dropna()
+
+        if chart_type == "Bar (mean of Y by X)":
+            grouped = data.groupby(x_col)[y_col].mean().reset_index()
+            if len(grouped) > 100:
+                st.warning("More than 100 groups — showing the first 100.")
+                grouped = grouped.head(100)
+            fig = px.bar(grouped, x=x_col, y=y_col)
+            sampled = False
+        else:
+            data, sampled = sample_for_plot(data)
+            if chart_type == "Scatter":
+                fig = px.scatter(data, x=x_col, y=y_col)
+            elif chart_type == "Line":
+                fig = px.line(data.sort_values(x_col), x=x_col, y=y_col)
+            elif chart_type == "Box":
+                fig = px.box(data, x=x_col if data[x_col].nunique() <= 30 else None, y=y_col)
+            else:
+                fig = px.histogram(data, x=x_col)
+
+        show_plot(fig, key="explorer_custom_chart")
+        if sampled:
+            st.caption(f"Showing a random sample of {MAX_PLOT_POINTS:,} points.")
+    except Exception as exc:
+        st.warning(f"Could not create this chart: {exc}")
 
 
-# =========================================================
-# DATA CLEANING
-# =========================================================
+OPERATIONS = [
+    "Remove duplicate rows",
+    "Drop rows with missing values",
+    "Remove rows with missing values in a selected column",
+    "Fill missing values in one column",
+    "Convert column to numeric",
+    "Convert column to datetime",
+    "Remove rows outside a numeric range",
+    "Trim whitespace from text",
+    "Standardize text to lowercase",
+    "Remove outliers using IQR",
+    "Clip a numeric column to a valid range",
+]
 
-elif page == "Data Cleaning":
+
+def parse_bound(text):
+    text = text.strip()
+    if not text:
+        return None, None
+    try:
+        return float(text), None
+    except ValueError:
+        return None, f"'{text}' is not a number."
+
+
+def apply_operation(df, operation, col, opts):
+    """Run one cleaning operation on a copy. Returns (new_df, details)."""
+    work = df.copy(deep=True)
+    details = ""
+
+    if operation == "Remove duplicate rows":
+        work = work.drop_duplicates()
+        details = f"Removed {len(df) - len(work):,} duplicate rows"
+
+    elif operation == "Drop rows with missing values":
+        work = work.dropna()
+        details = f"Removed {len(df) - len(work):,} rows"
+
+    elif operation == "Remove rows with missing values in a selected column":
+        work = work.dropna(subset=[col])
+        details = f"Removed {len(df) - len(work):,} rows"
+
+    elif operation == "Fill missing values in one column":
+        method = opts["fill_method"]
+        series = work[col]
+        missing_before = int(series.isna().sum())
+
+        if method in ("Median", "Mean", "Zero"):
+            if not is_numeric_col(series):
+                raise ValueError(
+                    f"{method} fill needs a numeric column. Convert '{col}' to "
+                    "numeric first, or use Mode / Forward fill / Backward fill."
+                )
+            value = {"Median": series.median(), "Mean": series.mean(), "Zero": 0}[method]
+            if pd.isna(value):
+                raise ValueError("The column has no valid values to compute a fill value.")
+            work[col] = series.fillna(value)
+        elif method == "Mode":
+            modes = series.mode(dropna=True)
+            if modes.empty:
+                raise ValueError("The column has no values to compute a mode.")
+            work[col] = series.fillna(modes.iloc[0])
+        elif method == "Forward fill":
+            work[col] = series.ffill()
+        else:
+            work[col] = series.bfill()
+
+        filled = missing_before - int(work[col].isna().sum())
+        details = f"Filled {filled:,} of {missing_before:,} missing values ({method.lower()})"
+
+    elif operation == "Convert column to numeric":
+        valid_before = int(work[col].notna().sum())
+        converted = pd.to_numeric(work[col], errors="coerce")
+        lost = valid_before - int(converted.notna().sum())
+        work[col] = converted
+        details = f"{lost:,} values could not be converted and became missing"
+
+    elif operation == "Convert column to datetime":
+        valid_before = int(work[col].notna().sum())
+        converted = parse_datetime(work[col])
+        lost = valid_before - int(converted.notna().sum())
+        work[col] = converted
+        details = f"{lost:,} values could not be parsed and became missing"
+
+    elif operation == "Remove rows outside a numeric range":
+        numeric = pd.to_numeric(work[col], errors="coerce")
+        outside = pd.Series(False, index=work.index)
+        if opts["lower"] is not None:
+            outside |= numeric < opts["lower"]
+        if opts["upper"] is not None:
+            outside |= numeric > opts["upper"]
+        if opts["drop_missing"]:
+            outside |= numeric.isna()
+        work = work.loc[~outside]
+        details = f"Removed {len(df) - len(work):,} rows outside the range"
+
+    elif operation in ("Trim whitespace from text", "Standardize text to lowercase"):
+        if opts["text_scope"] == "All text columns":
+            targets = [c for c in work.columns if is_text_col(work[c])]
+        else:
+            if not is_text_col(work[col]):
+                raise ValueError("Choose a text column, or apply to all text columns.")
+            targets = [col]
+
+        func = (
+            (lambda v: v.strip() if isinstance(v, str) else v)
+            if operation.startswith("Trim")
+            else (lambda v: v.lower() if isinstance(v, str) else v)
+        )
+        changed = 0
+        for target in targets:
+            old = work[target]
+            new = old.map(func)
+            changed += int((new.astype("string") != old.astype("string")).fillna(False).sum())
+            work[target] = new
+        details = f"Changed {changed:,} values in {len(targets)} column(s)"
+
+    elif operation == "Remove outliers using IQR":
+        numeric = pd.to_numeric(work[col], errors="coerce")
+        q1, q3 = numeric.quantile(0.25), numeric.quantile(0.75)
+        iqr = q3 - q1
+        if pd.isna(iqr):
+            raise ValueError("The column has no valid numeric values.")
+        outside = (numeric < q1 - 1.5 * iqr) | (numeric > q3 + 1.5 * iqr)
+        work = work.loc[~outside.fillna(False)]
+        details = f"Removed {len(df) - len(work):,} outlier rows (missing values kept)"
+
+    elif operation == "Clip a numeric column to a valid range":
+        numeric = pd.to_numeric(work[col], errors="coerce")
+        clipped = numeric.clip(lower=opts["lower"], upper=opts["upper"])
+        changed = int(((clipped != numeric) & numeric.notna()).sum())
+        work[col] = clipped
+        details = f"Clipped {changed:,} values"
+
+    return work, details
+
+
+def page_cleaning(df, m):
     st.header("Data Cleaning Workbench")
-
     st.write(
-        "Each operation is applied to the current dataset. "
-        "A snapshot is saved so you can undo recent changes."
+        "Each operation is applied to the current dataset. A snapshot is "
+        "saved first, so you can undo."
     )
 
-    st.subheader("Current Data Quality")
+    missing_total = cached("missing_total", lambda: int(df.isna().sum().sum()))
+    duplicates = cached("duplicates", lambda: int(df.duplicated().sum()))
 
     q1, q2, q3 = st.columns(3)
-    q1.metric("Missing Cells", int(df.isna().sum().sum()))
-    q2.metric("Duplicate Rows", int(df.duplicated().sum()))
-    q3.metric("Rows", len(df))
+    q1.metric("Missing cells", f"{missing_total:,}")
+    q2.metric("Duplicate rows", f"{duplicates:,}")
+    q3.metric("Rows", f"{len(df):,}")
 
-    operation = st.selectbox(
-        "Choose a cleaning operation",
-        [
-            "Remove duplicate rows",
-            "Drop rows with missing values",
-            "Fill missing values in one column",
-            "Convert column to numeric",
-            "Convert column to datetime",
-            "Remove rows outside a numeric range",
-            "Remove rows with missing values in a selected column",
-            "Trim whitespace from text columns",
-            "Standardize text to lowercase",
-            "Remove outliers using IQR",
-            "Clip a numeric column to a valid range"
-        ]
-    )
+    operation = st.selectbox("Cleaning operation", OPERATIONS)
 
-    selected_col = st.selectbox(
-        "Select the relevant column",
-        list(df.columns),
-        key="cleaning_column"
-    )
+    needs_column = operation not in (
+        "Remove duplicate rows", "Drop rows with missing values")
+    col = None
+    if needs_column:
+        col = st.selectbox("Column", list(df.columns), key="cleaning_column")
 
-    numeric_col = selected_col in numeric_columns
+    opts = {
+        "fill_method": "Median", "lower": None, "upper": None,
+        "drop_missing": False, "text_scope": "Selected column",
+    }
+    problems = []
 
-    fill_method = "Median"
     if operation == "Fill missing values in one column":
-        fill_method = st.selectbox(
+        opts["fill_method"] = st.selectbox(
             "Fill strategy",
-            ["Median", "Mean", "Zero", "Mode", "Forward fill", "Backward fill"]
-        )
+            ["Median", "Mean", "Zero", "Mode", "Forward fill", "Backward fill"])
+        if opts["fill_method"] in ("Median", "Mean", "Zero") and not is_numeric_col(df[col]):
+            problems.append(
+                "This column is not numeric. Use Mode / Forward / Backward fill, "
+                "or convert it to numeric first.")
 
-    lower = None
-    upper = None
-
-    if operation in [
-        "Remove rows outside a numeric range",
-        "Clip a numeric column to a valid range"
-    ]:
+    if operation in ("Remove rows outside a numeric range",
+                     "Clip a numeric column to a valid range"):
         st.caption("Enter only the bounds you need.")
         lower_text = st.text_input("Minimum value (optional)", "")
         upper_text = st.text_input("Maximum value (optional)", "")
+        opts["lower"], err_lo = parse_bound(lower_text)
+        opts["upper"], err_hi = parse_bound(upper_text)
+        problems += [e for e in (err_lo, err_hi) if e]
 
+        if not problems:
+            if opts["lower"] is None and opts["upper"] is None:
+                problems.append("Enter at least one bound.")
+            elif (opts["lower"] is not None and opts["upper"] is not None
+                  and opts["lower"] > opts["upper"]):
+                problems.append("The minimum must not be larger than the maximum.")
+
+        if operation == "Remove rows outside a numeric range":
+            opts["drop_missing"] = st.checkbox(
+                "Also remove rows where this column is missing / non-numeric",
+                value=False)
+
+    if operation in ("Trim whitespace from text", "Standardize text to lowercase"):
+        opts["text_scope"] = st.radio(
+            "Apply to", ["Selected column", "All text columns"], horizontal=True)
+
+    for message in problems:
+        st.error(message)
+
+    if st.button("Apply cleaning operation", type="primary", disabled=bool(problems)):
         try:
-            lower = float(lower_text) if lower_text.strip() else None
-            upper = float(upper_text) if upper_text.strip() else None
-        except ValueError:
-            st.error("Bounds must be numeric.")
-            lower = None
-            upper = None
-
-    if operation == "Fill missing values in one column" and fill_method in [
-        "Median", "Mean", "Zero"
-    ] and not numeric_col:
-        st.warning(
-            "The selected column is not numeric. "
-            "Use Mode, Forward fill, or Backward fill, or choose another column."
-        )
-
-    if st.button("Apply Cleaning Operation", type="primary"):
-        try:
-            working = df.copy(deep=True)
-            save_history(operation)
-
-            if operation == "Remove duplicate rows":
-                working = working.drop_duplicates()
-
-            elif operation == "Drop rows with missing values":
-                working = working.dropna()
-
-            elif operation == "Fill missing values in one column":
-                if fill_method == "Median":
-                    if not pd.api.types.is_numeric_dtype(working[selected_col]):
-                        raise ValueError("Median fill requires a numeric column.")
-                    value = pd.to_numeric(
-                        working[selected_col], errors="coerce"
-                    ).median()
-                    if pd.notna(value):
-                        working[selected_col] = working[selected_col].fillna(value)
-
-                elif fill_method == "Mean":
-                    if not pd.api.types.is_numeric_dtype(working[selected_col]):
-                        raise ValueError("Mean fill requires a numeric column.")
-                    value = pd.to_numeric(
-                        working[selected_col], errors="coerce"
-                    ).mean()
-                    if pd.notna(value):
-                        working[selected_col] = working[selected_col].fillna(value)
-
-                elif fill_method == "Zero":
-                    if not pd.api.types.is_numeric_dtype(working[selected_col]):
-                        raise ValueError("Zero fill requires a numeric column.")
-                    working[selected_col] = working[selected_col].fillna(0)
-
-                elif fill_method == "Mode":
-                    modes = working[selected_col].mode(dropna=True)
-                    if not modes.empty:
-                        working[selected_col] = working[selected_col].fillna(modes.iloc[0])
-
-                elif fill_method == "Forward fill":
-                    working[selected_col] = working[selected_col].ffill()
-
-                elif fill_method == "Backward fill":
-                    working[selected_col] = working[selected_col].bfill()
-
-            elif operation == "Convert column to numeric":
-                working[selected_col] = pd.to_numeric(
-                    working[selected_col], errors="coerce"
-                )
-
-            elif operation == "Convert column to datetime":
-                working[selected_col] = pd.to_datetime(
-                    working[selected_col], errors="coerce"
-                )
-
-            elif operation == "Remove rows outside a numeric range":
-                working[selected_col] = pd.to_numeric(
-                    working[selected_col], errors="coerce"
-                )
-                mask = working[selected_col].notna()
-
-                if lower is not None:
-                    mask &= working[selected_col] >= lower
-                if upper is not None:
-                    mask &= working[selected_col] <= upper
-
-                working = working[mask]
-
-            elif operation == "Remove rows with missing values in a selected column":
-                working = working.dropna(subset=[selected_col])
-
-            elif operation == "Trim whitespace from text columns":
-                if not (
-                    pd.api.types.is_object_dtype(working[selected_col])
-                    or pd.api.types.is_string_dtype(working[selected_col])
-                ):
-                    raise ValueError("Choose a text column for this operation.")
-                working[selected_col] = working[selected_col].map(
-                    lambda value: value.strip() if isinstance(value, str) else value
-                )
-
-            elif operation == "Standardize text to lowercase":
-                if not (
-                    pd.api.types.is_object_dtype(working[selected_col])
-                    or pd.api.types.is_string_dtype(working[selected_col])
-                ):
-                    raise ValueError("Choose a text column for this operation.")
-                working[selected_col] = working[selected_col].map(
-                    lambda value: value.lower() if isinstance(value, str) else value
-                )
-
-            elif operation in [
-                "Remove outliers using IQR",
-                "Clip a numeric column to a valid range"
-            ]:
-                if not pd.api.types.is_numeric_dtype(working[selected_col]):
-                    working[selected_col] = pd.to_numeric(
-                        working[selected_col], errors="coerce"
-                    )
-
-                if operation == "Remove outliers using IQR":
-                    values = working[selected_col]
-                    q1 = values.quantile(0.25)
-                    q3 = values.quantile(0.75)
-                    iqr = q3 - q1
-
-                    if pd.notna(iqr):
-                        lo = q1 - 1.5 * iqr
-                        hi = q3 + 1.5 * iqr
-                        working = working[
-                            working[selected_col].isna()
-                            | working[selected_col].between(lo, hi)
-                        ]
-
-                else:
-                    if lower is not None:
-                        working[selected_col] = working[selected_col].clip(lower=lower)
-                    if upper is not None:
-                        working[selected_col] = working[selected_col].clip(upper=upper)
-
-            st.session_state.df = working
-            st.session_state.cleaning_log.append({
-                "operation": operation,
-                "column": selected_col,
-                "rows_before": len(df),
-                "rows_after": len(working),
-                "missing_after": int(working.isna().sum().sum())
-            })
-
-            st.success(
-                f"Operation completed. Rows: {len(df):,} → {len(working):,}"
-            )
-            st.rerun()
-
+            working, details = apply_operation(df, operation, col, opts)
         except Exception as exc:
-            # Remove the snapshot if the operation failed.
-            if st.session_state.history:
-                st.session_state.history.pop()
             st.error(f"Cleaning operation failed: {exc}")
+        else:
+            if working.equals(df):
+                st.info("Nothing changed — no snapshot was saved.")
+            else:
+                push_history(operation)
+                st.session_state.cleaning_log.append(make_log_entry(
+                    operation, col or "(all)", len(df), working, details))
+                set_df(working)
+                set_flash("success", f"{operation}: {details}. "
+                                     f"Rows {len(df):,} → {len(working):,}.")
+                st.rerun()
 
     st.divider()
-
     left, right = st.columns(2)
 
     with left:
-        if st.button("Undo Last Operation"):
-            if st.session_state.history:
-                previous = st.session_state.history.pop()
-                st.session_state.df = previous["data"]
-
-                if st.session_state.cleaning_log:
-                    st.session_state.cleaning_log.pop()
-
-                st.success(f"Undid: {previous['action']}")
-                st.rerun()
+        if st.button("↩️ Undo last operation"):
+            action = undo_last()
+            if action is None:
+                st.warning("There is nothing to undo.")
             else:
-                st.warning("There is no operation to undo.")
+                set_flash("success", f"Undid: {action}")
+                st.rerun()
 
     with right:
-        if st.button("Reset to Original Dataset"):
-            st.session_state.df = st.session_state.original_df.copy(deep=True)
-            st.session_state.history = []
-            st.session_state.cleaning_log = []
-            st.success("Dataset reset to the original upload.")
+        if st.button("🔄 Reset to original dataset"):
+            reset_to_original()
+            set_flash("success", "Dataset reset to the original upload.")
             st.rerun()
 
-    st.subheader("Cleaning Preview")
-    st.dataframe(st.session_state.df.head(100), use_container_width=True)
+    st.subheader("Current data (first 100 rows)")
+    show_df(df.head(100))
 
-    st.subheader("Validation Report")
-
-    current = st.session_state.df
-    validation = pd.DataFrame({
-        "Column": current.columns,
-        "Data Type": [str(current[c].dtype) for c in current.columns],
-        "Missing": [int(current[c].isna().sum()) for c in current.columns],
-        "Unique": [int(current[c].nunique(dropna=True)) for c in current.columns]
-    })
-
-    st.dataframe(validation, use_container_width=True, hide_index=True)
+    st.subheader("Validation report")
+    show_df(cached("column_profile", lambda: column_profile(df)), hide_index=True)
 
 
-# =========================================================
-# TRANSPORT ANALYSIS
-# =========================================================
-
-elif page == "Transport Analysis":
+def page_transport(df, m):
     st.header("Smart Transportation Analysis")
+    st.caption("Columns come from the sidebar **Column mapping**.")
 
-    st.subheader("Automatic Column Detection")
+    ts_col, speed_col = m["timestamp"], m["speed"]
+    vol_col, road_col = m["volume"], m["road_id"]
 
-    st.dataframe(
-        pd.DataFrame({
-            "Field": list(detected.keys()),
-            "Detected Column": [
-                str(v) if v is not None else "Not detected"
-                for v in detected.values()
-            ]
-        }),
-        use_container_width=True,
-        hide_index=True
-    )
+    if not (ts_col or speed_col or vol_col):
+        st.info("Map a timestamp, speed or volume column in the sidebar to see more.")
 
-    st.subheader("Choose Columns Manually")
+    if speed_col:
+        speeds = pd.to_numeric(df[speed_col], errors="coerce").dropna()
+        if not speeds.empty:
+            st.subheader("Speed")
+            cols = st.columns(5)
+            cols[0].metric("Average", f"{speeds.mean():.2f}")
+            cols[1].metric("Median", f"{speeds.median():.2f}")
+            cols[2].metric("85th percentile", f"{speeds.quantile(0.85):.2f}")
+            cols[3].metric("Maximum", f"{speeds.max():.2f}")
+            cols[4].metric("Minimum", f"{speeds.min():.2f}")
+            st.caption("Units depend on the source dataset; none are assumed.")
+            plot_data, _ = sample_for_plot(speeds.to_frame(speed_col))
+            show_plot(px.histogram(plot_data, x=speed_col, title="Speed distribution"))
+        else:
+            st.warning(f"'{speed_col}' has no numeric values.")
 
-    all_columns = list(df.columns)
+    if vol_col:
+        volumes = pd.to_numeric(df[vol_col], errors="coerce").dropna()
+        if not volumes.empty:
+            st.subheader("Traffic volume")
+            cols = st.columns(4)
+            cols[0].metric("Average", f"{volumes.mean():,.2f}")
+            cols[1].metric("Median", f"{volumes.median():,.2f}")
+            cols[2].metric("Maximum", f"{volumes.max():,.2f}")
+            cols[3].metric("Sum of values", f"{volumes.sum():,.2f}")
+            plot_data, _ = sample_for_plot(volumes.to_frame(vol_col))
+            show_plot(px.histogram(plot_data, x=vol_col, title="Traffic volume distribution"))
+        else:
+            st.warning(f"'{vol_col}' has no numeric values.")
 
-    timestamp_col = st.selectbox(
-        "Timestamp / date column",
-        ["None"] + all_columns,
-        index=(all_columns.index(detected["timestamp"]) + 1)
-        if detected["timestamp"] in all_columns else 0
-    )
-
-    speed_col = st.selectbox(
-        "Speed column",
-        ["None"] + all_columns,
-        index=(all_columns.index(detected["speed"]) + 1)
-        if detected["speed"] in all_columns else 0
-    )
-
-    volume_col = st.selectbox(
-        "Traffic volume / count column",
-        ["None"] + all_columns,
-        index=(all_columns.index(detected["volume"]) + 1)
-        if detected["volume"] in all_columns else 0
-    )
-
-    if speed_col != "None":
-        speed_values = pd.to_numeric(df[speed_col], errors="coerce").dropna()
-
-        if not speed_values.empty:
-            a, b, c = st.columns(3)
-            a.metric("Average Speed", f"{speed_values.mean():.2f}")
-            b.metric("Maximum Speed", f"{speed_values.max():.2f}")
-            c.metric("Minimum Speed", f"{speed_values.min():.2f}")
-
-            st.caption(
-                "Speed units depend on the source dataset; "
-                "the app does not assume km/h or mph."
-            )
-
-            fig = px.histogram(
-                pd.DataFrame({speed_col: speed_values}),
-                x=speed_col,
-                title="Speed Distribution"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-    if volume_col != "None":
-        volume_values = pd.to_numeric(df[volume_col], errors="coerce").dropna()
-
-        if not volume_values.empty:
-            a, b, c = st.columns(3)
-            a.metric("Average Traffic Volume", f"{volume_values.mean():,.2f}")
-            b.metric("Maximum Traffic Volume", f"{volume_values.max():,.2f}")
-            c.metric("Total of Values", f"{volume_values.sum():,.2f}")
-
-            fig = px.histogram(
-                pd.DataFrame({volume_col: volume_values}),
-                x=volume_col,
-                title="Traffic Volume Distribution"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-    if timestamp_col != "None":
-        temp = df.copy()
-        temp[timestamp_col] = pd.to_datetime(
-            temp[timestamp_col], errors="coerce"
+    if ts_col:
+        st.subheader("Time patterns")
+        ts = cached("parsed_ts", lambda: parse_datetime(df[ts_col]), ts_col)
+        valid = ts.notna().to_numpy()
+        st.caption(
+            f"{int(valid.sum()):,} of {len(ts):,} timestamps parsed "
+            "(timezone-aware values are converted to UTC)."
         )
-        temp = temp.dropna(subset=[timestamp_col])
+        metrics = [c for c in (speed_col, vol_col) if c]
 
-        if not temp.empty:
-            st.subheader("Traffic Trends Over Time")
+        if valid.sum() == 0:
+            st.warning("No timestamps could be parsed. Check the mapped column.")
+        elif not metrics:
+            st.info("Map a speed or volume column to chart it over time.")
+        else:
+            metric = st.selectbox("Metric", metrics)
+            work = pd.DataFrame({
+                "ts": ts.to_numpy()[valid],
+                "value": pd.to_numeric(df[metric], errors="coerce").to_numpy()[valid],
+            })
+            if road_col:
+                work["road"] = df[road_col].astype("string").to_numpy()[valid]
+            work = work.dropna(subset=["value"])
 
-            metric_options = []
-            if speed_col != "None":
-                metric_options.append(speed_col)
-            if volume_col != "None" and volume_col not in metric_options:
-                metric_options.append(volume_col)
+            tab_trend, tab_hour, tab_day = st.tabs(
+                ["Trend", "By hour of day", "By day of week"])
 
-            if metric_options:
-                metric_col = st.selectbox(
-                    "Metric to chart over time",
-                    metric_options
-                )
+            with tab_trend:
+                days = (work["ts"].max() - work["ts"].min()).total_seconds() / 86400
+                options = {"15 minutes": "15min", "Hourly": "1h",
+                           "6 hours": "6h", "Daily": "1D", "Weekly": "1W"}
+                default = ("15 minutes" if days <= 3 else "Hourly" if days <= 30
+                           else "Daily" if days <= 365 else "Weekly")
+                label = st.selectbox(
+                    "Aggregation interval", list(options),
+                    index=list(options).index(default))
+                by_road = bool(road_col) and st.checkbox(
+                    "Split by road / segment (5 busiest)", value=False)
 
-                temp[metric_col] = pd.to_numeric(
-                    temp[metric_col], errors="coerce"
-                )
-
-                trend = (
-                    temp.dropna(subset=[metric_col])
-                    .set_index(timestamp_col)[metric_col]
-                    .sort_index()
-                    .resample("1h")
-                    .mean()
-                    .dropna()
-                    .reset_index()
-                )
-
-                if not trend.empty:
-                    fig = px.line(
-                        trend,
-                        x=timestamp_col,
-                        y=metric_col,
-                        title=f"Hourly Average: {metric_col}"
+                if by_road:
+                    top = work["road"].value_counts().head(5).index
+                    trend = (
+                        work[work["road"].isin(top)]
+                        .groupby(["road", pd.Grouper(key="ts", freq=options[label])])["value"]
+                        .mean().dropna().reset_index()
                     )
-                    st.plotly_chart(fig, use_container_width=True)
+                    fig = px.line(trend, x="ts", y="value", color="road")
                 else:
-                    st.info("No valid values were available for this trend.")
+                    trend = (
+                        work.set_index("ts")["value"].sort_index()
+                        .resample(options[label]).mean().dropna().reset_index()
+                    )
+                    fig = px.line(trend, x="ts", y="value")
 
-            st.subheader("Records by Hour of Day")
-            temp["Hour"] = temp[timestamp_col].dt.hour
+                fig.update_layout(
+                    title=f"{label} average of {metric}",
+                    xaxis_title="Time", yaxis_title=metric)
+                if trend.empty:
+                    st.info("No values available for this trend.")
+                else:
+                    show_plot(fig, key="trend_chart")
 
-            hourly = temp.groupby("Hour").size().reset_index(name="Records")
+            with tab_hour:
+                hourly = (work.groupby(work["ts"].dt.hour)["value"]
+                          .agg(["mean", "count"]).reset_index()
+                          .rename(columns={"ts": "Hour", "mean": "Average", "count": "Records"}))
+                show_plot(px.bar(hourly, x="Hour", y="Average",
+                                 hover_data=["Records"],
+                                 title=f"Average {metric} by hour of day"),
+                          key="hour_chart")
 
-            fig = px.bar(
-                hourly,
-                x="Hour",
-                y="Records",
-                title="Number of Records by Hour"
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            with tab_day:
+                names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                daily = (work.groupby(work["ts"].dt.dayofweek)["value"]
+                         .agg(["mean", "count"]).reset_index()
+                         .rename(columns={"ts": "Day", "mean": "Average", "count": "Records"}))
+                daily["Day"] = daily["Day"].map(lambda i: names[int(i)])
+                show_plot(px.bar(daily, x="Day", y="Average",
+                                 hover_data=["Records"],
+                                 title=f"Average {metric} by day of week"),
+                          key="day_chart")
 
-    st.subheader("Numeric Correlations")
+    st.subheader("Numeric correlations")
+    ids = identifier_columns(df, m)
+    numbers = [c for c in numeric_columns(df) if c not in ids]
 
-    numeric_df = df.select_dtypes(include=np.number)
-
-    if numeric_df.shape[1] >= 2:
-        corr = numeric_df.corr()
-        fig = px.imshow(
-            corr,
-            text_auto=".2f",
-            aspect="auto",
-            title="Correlation Matrix"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    if len(numbers) < 2:
+        st.info("At least two numeric (non-ID) columns are needed.")
     else:
-        st.info("At least two numeric columns are needed for correlations.")
+        chosen = st.multiselect("Columns", numbers, default=numbers[:12])
+        if len(chosen) >= 2:
+            corr = df[chosen].corr(numeric_only=True)
+            show_plot(px.imshow(corr, text_auto=".2f", aspect="auto",
+                                title="Correlation matrix",
+                                color_continuous_scale="RdBu_r",
+                                zmin=-1, zmax=1),
+                      key="corr_chart")
 
 
-# =========================================================
-# INTERACTIVE MAP
-# =========================================================
-
-elif page == "Interactive Map":
+def page_map(df, m):
     st.header("Interactive Mobility Map")
 
-    columns = list(df.columns)
-
-    lat_default = detected["latitude"]
-    lon_default = detected["longitude"]
-
-    lat_col = st.selectbox(
-        "Latitude column",
-        ["None"] + columns,
-        index=(columns.index(lat_default) + 1)
-        if lat_default in columns else 0
-    )
-
-    lon_col = st.selectbox(
-        "Longitude column",
-        ["None"] + columns,
-        index=(columns.index(lon_default) + 1)
-        if lon_default in columns else 0
-    )
-
-    if lat_col == "None" or lon_col == "None":
+    lat_col, lon_col = m["latitude"], m["longitude"]
+    if not (lat_col and lon_col):
         st.info(
-            "Choose latitude and longitude columns to display a map. "
-            "If your dataset has no geographic coordinates, "
-            "you will need a dataset that includes them."
+            "Map both latitude and longitude in the sidebar (**Column mapping**) "
+            "to display a map."
         )
+        return
+
+    valid = cached(
+        "valid_coords",
+        lambda: (
+            pd.to_numeric(df[lat_col], errors="coerce").between(-90, 90)
+            & pd.to_numeric(df[lon_col], errors="coerce").between(-180, 180)
+        ).to_numpy(),
+        lat_col, lon_col,
+    )
+    st.metric("Rows with valid coordinates", f"{int(valid.sum()):,}")
+    if not valid.any():
+        st.warning("No valid coordinate pairs were found.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    mode = c1.radio("Display", ["Points", "Clusters", "Heatmap"], horizontal=True)
+    max_points = c2.slider("Max points drawn", 500, 20000, 2000, step=500)
+
+    color_col = None
+    weight_col = None
+    if mode == "Points":
+        color_col = c3.selectbox("Colour by (optional)", ["None"] + list(df.columns))
+        color_col = None if color_col == "None" else color_col
+    elif mode == "Heatmap":
+        weight = c3.selectbox("Weight by (optional)", ["None"] + numeric_columns(df))
+        weight_col = None if weight == "None" else weight
+
+    map_df = df.loc[valid].copy()
+    map_df[lat_col] = pd.to_numeric(map_df[lat_col], errors="coerce")
+    map_df[lon_col] = pd.to_numeric(map_df[lon_col], errors="coerce")
+
+    total_valid = len(map_df)
+    if total_valid > max_points:
+        map_df = map_df.sample(max_points, random_state=42)
+
+    lats, lons = map_df[lat_col].to_numpy(), map_df[lon_col].to_numpy()
+
+    mobility_map = folium.Map(tiles="OpenStreetMap", control_scale=True)
+    if np.isclose(lats.min(), lats.max()) and np.isclose(lons.min(), lons.max()):
+        mobility_map.location = [float(lats[0]), float(lons[0])]
+        mobility_map.options["zoom"] = 14
     else:
-        map_df = valid_coordinates(df, lat_col, lon_col)
+        mobility_map.fit_bounds([
+            [float(lats.min()), float(lons.min())],
+            [float(lats.max()), float(lons.max())],
+        ])
 
-        st.metric("Rows with Valid Coordinates", f"{len(map_df):,}")
+    legend_html = ""
 
-        if map_df.empty:
-            st.warning("No valid coordinate pairs were found.")
-        else:
-            map_color = st.selectbox(
-                "Color points by (optional)",
-                ["None"] + list(df.columns)
-            )
+    if mode == "Heatmap":
+        points = map_df[[lat_col, lon_col]].to_numpy().tolist()
+        if weight_col:
+            weights = pd.to_numeric(map_df[weight_col], errors="coerce").fillna(0)
+            weights = weights - weights.min()
+            top = weights.max()
+            weights = weights / top if top > 0 else weights + 1
+            points = [p + [float(w)] for p, w in zip(points, weights)]
+        HeatMap(points, radius=12, blur=15).add_to(mobility_map)
+    else:
+        popup_cols = list(df.columns[:8])
+        if color_col and color_col not in popup_cols:
+            popup_cols.append(color_col)
+        records = map_df[popup_cols].to_dict("records")
 
-            map_center = [
-                float(map_df[lat_col].median()),
-                float(map_df[lon_col].median())
-            ]
-
-            mobility_map = folium.Map(
-                location=map_center,
-                zoom_start=11,
-                control_scale=True
-            )
-
-            # Avoid rendering too many individual markers.
-            
-            plotted_df = map_df
-
-            for _, row in plotted_df.iterrows():
-                popup_lines = [
-                    f"{col}: {row[col]}"
-                    for col in df.columns[:8]
-                    if pd.notna(row[col])
+        colors = ["#3388ff"] * len(map_df)
+        if color_col:
+            raw = map_df[color_col]
+            numeric = pd.to_numeric(raw, errors="coerce")
+            if is_numeric_col(raw) and numeric.notna().any():
+                vmin, vmax = numeric.quantile(0.02), numeric.quantile(0.98)
+                if not vmax > vmin:
+                    vmin, vmax = numeric.min(), numeric.max()
+                if not vmax > vmin:
+                    vmax = vmin + 1
+                cmap = LinearColormap(
+                    ["#2c7bb6", "#ffffbf", "#d7191c"],
+                    vmin=float(vmin), vmax=float(vmax), caption=color_col)
+                cmap.add_to(mobility_map)
+                colors = [
+                    cmap(float(min(max(v, vmin), vmax))) if pd.notna(v) else "#999999"
+                    for v in numeric
                 ]
+            else:
+                labels = raw.astype("string").fillna("(Missing)")
+                top = list(labels.value_counts().head(10).index)
+                palette = px.colors.qualitative.Safe
+                lookup = {cat: palette[i % len(palette)] for i, cat in enumerate(top)}
+                colors = [lookup.get(v, "#999999") for v in labels]
+                legend_items = [(c, lookup[c]) for c in top]
+                if labels.nunique() > len(top):
+                    legend_items.append(("Other", "#999999"))
+                legend_html = " &nbsp; ".join(
+                    f"<span style='color:{col}'>●</span> {html.escape(str(name))}"
+                    for name, col in legend_items)
 
-                popup_text = "\n".join(popup_lines)
+        target = MarkerCluster().add_to(mobility_map) if mode == "Clusters" else mobility_map
+        for lat, lon, record, color in zip(lats, lons, records, colors):
+            popup = "<br>".join(
+                f"<b>{html.escape(str(k))}</b>: {html.escape(str(v))}"
+                for k, v in record.items() if pd.notna(v))
+            folium.CircleMarker(
+                location=[float(lat), float(lon)],
+                radius=4, color=color, fill=True, fill_color=color,
+                fill_opacity=0.75,
+                popup=folium.Popup(popup or "Mobility record", max_width=300),
+            ).add_to(target)
 
-                folium.CircleMarker(
-                    location=[
-                        float(row[lat_col]),
-                        float(row[lon_col])
-                    ],
-                    radius=4,
-                    popup=folium.Popup(
-                        popup_text or "Mobility record",
-                        max_width=300
-                    ),
-                    tooltip="Mobility record",
-                    fill=True
-                ).add_to(mobility_map)
+    st_folium(mobility_map, width=None, height=550,
+              returned_objects=[], key="mobility_map")
 
-            st_folium(
-                mobility_map,
-                width=None,
-                height=550,
-                returned_objects=[]
-            )
+    if legend_html:
+        st.markdown(legend_html, unsafe_allow_html=True)
 
-            st.caption(
-                f"Showing all {len(plotted_df):,} valid records on the map."
-            )   
-
-            st.caption(
-                "The optional color selection is available for future "
-                "categorical map styling; this version displays markers "
-                "with popups containing record details."
-            )
+    note = f"Showing {len(map_df):,} of {total_valid:,} valid records"
+    st.caption(note + (" (random sample — raise the slider to draw more)."
+                       if total_valid > max_points else "."))
 
 
-# =========================================================
-# TRAFFIC PREDICTION
-# =========================================================
+def evaluate(y_true, y_pred):
+    r2 = r2_score(y_true, y_pred) if len(y_true) > 1 and y_true.nunique() > 1 else None
+    return {
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "r2": float(r2) if r2 is not None and np.isfinite(r2) else None,
+    }
 
-elif page == "Traffic Prediction":
-    st.header("Traffic Prediction — Machine Learning")
 
-    st.write(
-        "Train a model to estimate a numeric traffic metric from other "
-        "available fields. This is a baseline predictive model, not a "
-        "guaranteed real-world traffic forecast."
-    )
+def train_model(df, m, target_col, feature_cols, use_time, split_mode,
+                test_pct, model_type, n_estimators):
+    ts_col = m["timestamp"]
+    chronological = split_mode.startswith("Chronological")
 
-    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+    X = (df[feature_cols].apply(pd.to_numeric, errors="coerce")
+         if feature_cols else pd.DataFrame(index=df.index))
+    y = pd.to_numeric(df[target_col], errors="coerce")
 
-    if len(numeric_cols) < 2:
-        st.warning(
-            "At least two numeric columns are required: one target "
-            "and at least one feature."
-        )
-        st.stop()
+    ts = None
+    if ts_col and (use_time or chronological):
+        ts = parse_datetime(df[ts_col])
+    if chronological and ts is None:
+        raise ValueError("A chronological split needs a mapped timestamp column.")
 
-    default_target = detected["target"]
+    if use_time and ts is not None:
+        X["time_hour"] = ts.dt.hour
+        X["time_dayofweek"] = ts.dt.dayofweek
+        X["time_month"] = ts.dt.month
+        X["time_is_weekend"] = (ts.dt.dayofweek >= 5).astype(float).where(ts.notna())
 
-    target_col = st.selectbox(
-        "Prediction target",
-        numeric_cols,
-        index=numeric_cols.index(default_target)
-        if default_target in numeric_cols else 0
-    )
+    X = X.replace([np.inf, -np.inf], np.nan)
 
-    available_features = [
-        col for col in numeric_cols if col != target_col
-    ]
+    valid = (y.notna() & np.isfinite(y)).to_numpy().copy()
+    if chronological:
+        valid = valid & ts.notna().to_numpy()
 
-    feature_cols = st.multiselect(
-        "Model features",
-        available_features,
-        default=available_features[:min(5, len(available_features))]
-    )
+    X = X.loc[valid].reset_index(drop=True)
+    y = y.loc[valid].reset_index(drop=True)
+    ts_valid = ts.loc[valid].reset_index(drop=True) if ts is not None else None
 
-    timestamp_feature = None
+    if len(X) < 20:
+        raise ValueError("At least 20 rows with a valid target are required.")
+    if y.nunique() < 2:
+        raise ValueError("The target has fewer than two distinct values.")
+    if X.shape[1] == 0:
+        raise ValueError("Select at least one feature (or enable time features).")
 
-    if detected["timestamp"] and detected["timestamp"] in df.columns:
-        use_time = st.checkbox(
-            "Extract hour/day features from the detected timestamp",
-            value=True
-        )
-        if use_time:
-            timestamp_feature = detected["timestamp"]
+    if chronological:
+        order = np.argsort(ts_valid.to_numpy(), kind="stable")
+        X, y, ts_valid = X.iloc[order], y.iloc[order], ts_valid.iloc[order]
+        n_test = max(1, int(round(len(X) * test_pct / 100)))
+        n_train = len(X) - n_test
+        if n_train < 10:
+            raise ValueError("Not enough rows left for training; lower the test share.")
+        X_train, X_test = X.iloc[:n_train], X.iloc[n_train:]
+        y_train, y_test = y.iloc[:n_train], y.iloc[n_train:]
+        ts_test = ts_valid.iloc[n_train:]
     else:
-        use_time = False
+        arrays = [X, y] + ([ts_valid] if ts_valid is not None else [])
+        parts = train_test_split(*arrays, test_size=test_pct / 100, random_state=42)
+        X_train, X_test, y_train, y_test = parts[:4]
+        ts_test = parts[5] if ts_valid is not None else None
 
-    test_size = st.slider(
-        "Test set percentage",
-        min_value=10,
-        max_value=40,
-        value=20,
-        step=5
-    )
+    usable = [c for c in X_train.columns if X_train[c].nunique(dropna=True) > 1]
+    if not usable:
+        raise ValueError("All selected features are empty or constant in the training data.")
+    X_train, X_test = X_train[usable], X_test[usable]
 
-    model_type = st.selectbox(
-        "Model",
-        ["Random Forest Regressor", "Linear Regression"]
-    )
+    notes = []
+    if len(X_train) > MAX_TRAIN_ROWS:
+        rng = np.random.default_rng(42)
+        pick = np.sort(rng.choice(len(X_train), MAX_TRAIN_ROWS, replace=False))
+        X_train, y_train = X_train.iloc[pick], y_train.iloc[pick]
+        notes.append(f"Training used a random sample of {MAX_TRAIN_ROWS:,} rows.")
 
-    if st.button("Train and Evaluate Model", type="primary"):
-        try:
-            model_df = df.copy()
+    leaks = X_train.corrwith(y_train).abs()
+    leak_cols = [c for c, v in leaks.items() if pd.notna(v) and v > 0.98]
 
-            if not feature_cols:
-                raise ValueError("Select at least one numeric feature.")
+    steps = [("imputer", SimpleImputer(strategy="median"))]
+    if model_type == "Linear Regression":
+        steps += [("scaler", StandardScaler()), ("model", LinearRegression())]
+    else:
+        steps.append(("model", RandomForestRegressor(
+            n_estimators=n_estimators, min_samples_leaf=2,
+            random_state=42, n_jobs=-1)))
+    model = Pipeline(steps)
+    model.fit(X_train, y_train)
+    predictions = model.predict(X_test)
 
-            X = model_df[feature_cols].copy()
-            y = pd.to_numeric(model_df[target_col], errors="coerce")
+    baseline_pred = np.full(len(y_test), float(y_train.mean()))
 
-            if timestamp_feature:
-                timestamps = pd.to_datetime(
-                    model_df[timestamp_feature], errors="coerce"
-                )
+    fitted = model.named_steps["model"]
+    if model_type == "Linear Regression":
+        raw = np.abs(fitted.coef_)
+        label = "Relative influence (|standardised coefficient|)"
+    else:
+        raw = fitted.feature_importances_
+        label = "Importance (Random Forest)"
+    total = raw.sum()
+    importance = pd.DataFrame({
+        "Feature": usable,
+        "Influence": raw / total if total > 0 else raw,
+    }).sort_values("Influence", ascending=False)
 
-                X["timestamp_hour"] = timestamps.dt.hour
-                X["timestamp_day_of_week"] = timestamps.dt.dayofweek
-                X["timestamp_month"] = timestamps.dt.month
+    results = pd.DataFrame({
+        "Actual": y_test.to_numpy(),
+        "Predicted": predictions,
+    })
+    results["Residual"] = results["Actual"] - results["Predicted"]
+    if ts_test is not None:
+        results.insert(0, "Timestamp", ts_test.to_numpy())
 
-            # Ensure all model features are numeric.
-            for col in X.columns:
-                X[col] = pd.to_numeric(X[col], errors="coerce")
+    return {
+        "model_name": model_type,
+        "target": target_col,
+        "features": usable,
+        "split": "chronological" if chronological else "random",
+        "training_rows": int(len(X_train)),
+        "test_rows": int(len(X_test)),
+        "metrics": evaluate(y_test, predictions),
+        "baseline_metrics": evaluate(y_test, baseline_pred),
+        "results": results,
+        "importance": importance,
+        "importance_label": label,
+        "possible_leakage": leak_cols,
+        "notes": notes,
+        "trained_on_version": int(st.session_state.df_version),
+    }
 
-            # Infinite values are invalid for model training.
-            X = X.replace([np.inf, -np.inf], np.nan)
 
-            valid_target = y.notna() & np.isfinite(y)
-            X = X.loc[valid_target]
-            y = y.loc[valid_target]
+def render_model_results(res):
+    st.subheader("Evaluation")
 
-            if len(X) < 10:
-                raise ValueError(
-                    "At least 10 rows with a valid target are required. "
-                    "More data is recommended."
-                )
-
-            if y.nunique() < 2:
-                raise ValueError(
-                    "The target has fewer than two distinct values."
-                )
-
-            if X.dropna(axis=1, how="all").shape[1] == 0:
-                raise ValueError("All selected features are empty.")
-
-            # Remove features that contain no valid data.
-            X = X.dropna(axis=1, how="all")
-
-            # Remove constant features.
-            X = X.loc[:, X.nunique(dropna=True) > 1]
-
-            if X.empty or X.shape[1] == 0:
-                raise ValueError(
-                    "No usable feature columns remain after validation."
-                )
-
-            # Random row split: appropriate for a basic baseline only.
-            # For future forecasting, use a chronological split.
-            X_train, X_test, y_train, y_test = train_test_split(
-                X,
-                y,
-                test_size=test_size / 100,
-                random_state=42
-            )
-
-            estimator = (
-                RandomForestRegressor(
-                    n_estimators=200,
-                    random_state=42,
-                    min_samples_leaf=2,
-                    n_jobs=-1
-                )
-                if model_type == "Random Forest Regressor"
-                else LinearRegression()
-            )
-
-            model = Pipeline([
-                ("imputer", SimpleImputer(strategy="median")),
-                ("scaler", StandardScaler()),
-                ("model", estimator)
-            ])
-
-            model.fit(X_train, y_train)
-            predictions = model.predict(X_test)
-
-            mae = mean_absolute_error(y_test, predictions)
-            rmse = np.sqrt(mean_squared_error(y_test, predictions))
-            r2 = r2_score(y_test, predictions) if len(y_test) > 1 else np.nan
-
-            st.session_state["last_model_results"] = {
-                "model_name": model_type,
-                "target": target_col,
-                "features": list(X.columns),
-                "mae": float(mae),
-                "rmse": float(rmse),
-                "r2": float(r2) if np.isfinite(r2) else None,
-                "training_rows": int(len(X_train)),
-                "test_rows": int(len(X_test))
-            }
-
-            st.subheader("Evaluation Metrics")
-
-            m1, m2, m3 = st.columns(3)
-            m1.metric("MAE", f"{mae:.4f}")
-            m2.metric("RMSE", f"{rmse:.4f}")
-            m3.metric(
-                "R²",
-                f"{r2:.4f}" if np.isfinite(r2) else "Unavailable"
-            )
-
-            st.caption(
-                "MAE and RMSE are in the target's units. "
-                "Lower errors are generally better. R² may be negative "
-                "when predictions perform poorly. Metrics must be "
-                "compared against a sensible baseline."
-            )
-
-            results_df = pd.DataFrame({
-                "Actual": y_test.to_numpy(),
-                "Predicted": predictions
-            })
-
-            fig = px.scatter(
-                results_df,
-                x="Actual",
-                y="Predicted",
-                title="Actual vs Predicted"
-            )
-
-            low = min(
-                results_df["Actual"].min(),
-                results_df["Predicted"].min()
-            )
-            high = max(
-                results_df["Actual"].max(),
-                results_df["Predicted"].max()
-            )
-
-            fig.add_shape(
-                type="line",
-                x0=low,
-                y0=low,
-                x1=high,
-                y1=high,
-                line=dict(dash="dash")
-            )
-
-            st.plotly_chart(fig, use_container_width=True)
-
-            results_df["Residual"] = (
-                results_df["Actual"] - results_df["Predicted"]
-            )
-
-            st.subheader("Prediction Results")
-            st.dataframe(results_df, use_container_width=True)
-
-            st.download_button(
-                "Download Prediction Results CSV",
-                data=results_df.to_csv(index=False).encode("utf-8"),
-                file_name="traffic_prediction_results.csv",
-                mime="text/csv"
-            )
-
-            st.download_button(
-                "Download Model Metrics JSON",
-                data=json.dumps(
-                    st.session_state["last_model_results"],
-                    indent=2
-                ),
-                file_name="traffic_model_metrics.json",
-                mime="application/json"
-            )
-
-        except Exception as exc:
-            st.error(f"Model training failed: {exc}")
-
-    if "last_model_results" in st.session_state:
-        st.divider()
-        st.subheader("Last Model Evaluation")
-
-        st.json(st.session_state["last_model_results"])
-
+    if res["trained_on_version"] != st.session_state.df_version:
         st.warning(
-            "For true future traffic forecasting, sort records by time "
-            "and evaluate on later observations. A random train/test split "
-            "can give overly optimistic results when records are time-dependent."
+            "The dataset has changed since this model was trained. "
+            "Retrain to reflect the current data."
         )
 
+    for note in res["notes"]:
+        st.info(note)
+    if res["possible_leakage"]:
+        st.warning(
+            "Possible target leakage — these features are almost perfectly "
+            "correlated with the target: " + ", ".join(res["possible_leakage"])
+        )
 
-# =========================================================
-# EXPORT & HISTORY
-# =========================================================
+    model_m, base_m = res["metrics"], res["baseline_metrics"]
 
-elif page == "Export & History":
-    st.header("Export & Cleaning History")
+    def fmt(value):
+        return f"{value:.4f}" if value is not None else "n/a"
 
-    st.subheader("Download Current Dataset")
+    a, b, c = st.columns(3)
+    a.metric("MAE", fmt(model_m["mae"]),
+             f"{base_m['mae'] - model_m['mae']:+.4f} vs baseline",
+             help="Positive delta = better than the baseline.")
+    b.metric("RMSE", fmt(model_m["rmse"]),
+             f"{base_m['rmse'] - model_m['rmse']:+.4f} vs baseline")
+    c.metric("R²", fmt(model_m["r2"]))
+
+    show_df(pd.DataFrame(
+        {"MAE": [model_m["mae"], base_m["mae"]],
+         "RMSE": [model_m["rmse"], base_m["rmse"]],
+         "R²": [model_m["r2"], base_m["r2"]]},
+        index=[f"{res['model_name']}", "Baseline (predict training mean)"]))
+
+    if model_m["mae"] >= base_m["mae"]:
+        st.warning("The model does not beat the simple mean baseline on the test data.")
+
+    st.caption(
+        f"Split: {res['split']} — {res['training_rows']:,} training rows, "
+        f"{res['test_rows']:,} test rows. Errors are in the target's units."
+    )
+    if res["split"] == "random":
+        st.caption(
+            "A random split can be over-optimistic for time-dependent data. "
+            "Use the chronological split to test on later observations."
+        )
+
+    results = res["results"]
+    plot_data, sampled = sample_for_plot(results)
+
+    fig = px.scatter(plot_data, x="Actual", y="Predicted", title="Actual vs predicted")
+    low = float(min(plot_data["Actual"].min(), plot_data["Predicted"].min()))
+    high = float(max(plot_data["Actual"].max(), plot_data["Predicted"].max()))
+    fig.add_shape(type="line", x0=low, y0=low, x1=high, y1=high,
+                  line=dict(dash="dash"))
+    show_plot(fig, key="pred_scatter")
+    if sampled:
+        st.caption(f"Plot shows a random sample of {MAX_PLOT_POINTS:,} test rows.")
+
+    left, right = st.columns(2)
+    with left:
+        show_plot(px.histogram(plot_data, x="Residual", title="Residuals"),
+                  key="pred_resid")
+    with right:
+        show_plot(px.bar(res["importance"], x="Influence", y="Feature",
+                         orientation="h", title=res["importance_label"]),
+                  key="pred_importance")
+
+    st.subheader("Prediction results")
+    show_df(results.head(1000))
+    if len(results) > 1000:
+        st.caption("Showing the first 1,000 rows; the download contains all of them.")
 
     st.download_button(
-        "Download Cleaned CSV",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name="smart_mobility_cleaned.csv",
-        mime="text/csv"
+        "Download prediction results (CSV)",
+        data=results.to_csv(index=False).encode("utf-8"),
+        file_name="traffic_prediction_results.csv", mime="text/csv")
+
+    summary = {k: res[k] for k in (
+        "model_name", "target", "features", "split", "training_rows",
+        "test_rows", "metrics", "baseline_metrics", "possible_leakage")}
+    st.download_button(
+        "Download model metrics (JSON)",
+        data=json.dumps(summary, indent=2),
+        file_name="traffic_model_metrics.json", mime="application/json")
+
+
+def page_prediction(df, m):
+    st.header("Traffic Prediction — Machine Learning")
+    st.write(
+        "Train a baseline model that estimates a numeric traffic metric from "
+        "other fields. This is not a guaranteed real-world forecast."
     )
 
-    st.subheader("Cleaning History")
+    numbers = numeric_columns(df)
+    if len(numbers) < 2 and not m["timestamp"]:
+        st.warning(
+            "Need at least two numeric columns (one target, one feature), "
+            "or one numeric column plus a timestamp."
+        )
+        return
+    if not numbers:
+        st.warning("No numeric columns are available for a target.")
+        return
 
+    default_target = m["volume"] or m["speed"]
+    target_col = st.selectbox(
+        "Prediction target", numbers,
+        index=numbers.index(default_target) if default_target in numbers else 0)
+
+    ids = identifier_columns(df, m)
+    candidates = [c for c in numbers if c != target_col and c not in ids]
+    feature_cols = st.multiselect(
+        "Model features", candidates, default=candidates[:5],
+        help="ID-like columns are excluded from the list.")
+
+    use_time = False
+    if m["timestamp"]:
+        use_time = st.checkbox(
+            "Add hour / day-of-week / month / weekend features from the timestamp",
+            value=True)
+
+    split_options = ["Random split"]
+    if m["timestamp"]:
+        split_options.insert(0, "Chronological (train on earlier, test on later)")
+    split_mode = st.radio("Train/test split", split_options)
+
+    c1, c2 = st.columns(2)
+    test_pct = c1.slider("Test set %", 10, 40, 20, step=5)
+    model_type = c2.selectbox("Model", ["Random Forest Regressor", "Linear Regression"])
+    n_estimators = 150
+    if model_type == "Random Forest Regressor":
+        n_estimators = c2.slider("Number of trees", 50, 300, 150, step=50)
+
+    if st.button("Train and evaluate model", type="primary"):
+        with st.spinner("Training..."):
+            try:
+                st.session_state.last_model = train_model(
+                    df, m, target_col, feature_cols, use_time, split_mode,
+                    test_pct, model_type, n_estimators)
+            except Exception as exc:
+                st.session_state.last_model = None
+                st.error(f"Model training failed: {exc}")
+
+    # Rendered outside the button block so results survive reruns
+    # (e.g. clicking a download button).
+    if st.session_state.last_model is not None:
+        st.divider()
+        render_model_results(st.session_state.last_model)
+
+
+def page_export(df, m):
+    st.header("Export & Cleaning History")
+
+    original = st.session_state.original_df
+    st.subheader("Original vs current")
+    orig_missing = int(original.isna().sum().sum())
+    cur_missing = cached("missing_total", lambda: int(df.isna().sum().sum()))
+    a, b, c = st.columns(3)
+    a.metric("Rows", f"{len(df):,}", f"{len(df) - len(original):+,} vs original")
+    b.metric("Columns", f"{len(df.columns):,}")
+    c.metric("Missing cells", f"{cur_missing:,}", f"{cur_missing - orig_missing:+,} vs original",
+             delta_color="inverse")
+
+    st.subheader("Download current dataset")
+    csv_bytes = cached("csv_bytes", lambda: df.to_csv(index=False).encode("utf-8"))
+    st.download_button("Download cleaned CSV", data=csv_bytes,
+                       file_name="smart_mobility_cleaned.csv", mime="text/csv")
+
+    if len(df) > MAX_EXCEL_ROWS:
+        st.caption("Excel export is unavailable: too many rows for one worksheet.")
+    else:
+        if st.button("Prepare Excel file (.xlsx)"):
+            with st.spinner("Building workbook..."):
+                buffer = BytesIO()
+                df.to_excel(buffer, index=False, engine="openpyxl")
+                st.session_state["xlsx_ready"] = (
+                    st.session_state.df_version, buffer.getvalue())
+
+        ready = st.session_state.get("xlsx_ready")
+        if ready and ready[0] == st.session_state.df_version:
+            st.download_button(
+                "Download Excel file", data=ready[1],
+                file_name="smart_mobility_cleaned.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    st.subheader("Cleaning history")
     if st.session_state.cleaning_log:
         history_df = pd.DataFrame(st.session_state.cleaning_log)
-        st.dataframe(history_df, use_container_width=True, hide_index=True)
-
+        show_df(history_df, hide_index=True)
         st.download_button(
-            "Download Cleaning History CSV",
+            "Download cleaning history (CSV)",
             data=history_df.to_csv(index=False).encode("utf-8"),
-            file_name="cleaning_history.csv",
-            mime="text/csv"
-        )
+            file_name="cleaning_history.csv", mime="text/csv")
     else:
         st.info("No cleaning operations have been recorded in this session.")
 
-    st.subheader("Undo Snapshots")
-
+    st.subheader("Undo snapshots")
     if st.session_state.history:
-        snapshots = pd.DataFrame([
-            {
-                "Operation": item["action"],
-                "Snapshot Rows": len(item["data"]),
-                "Snapshot Columns": len(item["data"].columns)
-            }
-            for item in st.session_state.history
-        ])
-        st.dataframe(snapshots, use_container_width=True, hide_index=True)
+        show_df(pd.DataFrame([
+            {"Operation": s["action"],
+             "Snapshot rows": len(s["data"]),
+             "Snapshot columns": len(s["data"].columns)}
+            for s in st.session_state.history
+        ]), hide_index=True)
     else:
         st.info("No undo snapshots are currently available.")
 
     st.caption(
-        "Cleaning history and undo snapshots are stored in the current "
-        "Streamlit session. They are not permanent audit logs."
+        "History and snapshots live in the current Streamlit session only; "
+        "they are not a permanent audit log."
     )
 
 
+PAGES = {
+    "Overview": page_overview,
+    "Data Intelligence": page_intelligence,
+    "Data Explorer": page_explorer,
+    "Data Cleaning": page_cleaning,
+    "Transport Analysis": page_transport,
+    "Interactive Map": page_map,
+    "Traffic Prediction": page_prediction,
+    "Export & History": page_export,
+}
+
+
+# ===== MAIN =====
 # =========================================================
-# FOOTER
+# APP FLOW
 # =========================================================
 
-st.divider()
+def main():
+    init_state()
 
-st.caption(
-    "Smart Mobility Analytics Studio V2 | "
-    "Built with Streamlit, pandas, Plotly, Folium and scikit-learn"
-)
+    st.sidebar.title("🚦 Mobility Studio")
+    st.sidebar.caption("Smart Mobility Analytics Studio — V3")
+
+    page = st.sidebar.radio("Navigation", list(PAGES))
+    st.sidebar.divider()
+
+    st.title("Smart Mobility Analytics Studio")
+    st.caption("Transportation data analytics & machine learning")
+
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload transportation data",
+        type=["csv", "xlsx", "zip"],
+        help="Upload a CSV, an Excel workbook (.xlsx) or a ZIP archive.",
+    )
+
+    if uploaded_file is not None:
+        try:
+            file_bytes = uploaded_file.getvalue()
+            file_key = (uploaded_file.name, uploaded_file.size)
+            member = None
+
+            if uploaded_file.name.lower().endswith(".zip"):
+                members = list_zip_members(file_bytes, file_key)
+                if not members:
+                    st.error("The ZIP archive contains no supported CSV or XLSX files.")
+                    st.stop()
+                member = st.sidebar.selectbox(
+                    "Choose a file inside the ZIP", members,
+                    key=f"zip_file_{file_key}")
+
+            inner_name = member or uploaded_file.name
+            sheet = None
+
+            if inner_name.lower().endswith(".xlsx"):
+                sheets = list_excel_sheets(file_bytes, file_key, member)
+                if not sheets:
+                    st.error("The Excel workbook contains no worksheets.")
+                    st.stop()
+                sheet = st.sidebar.selectbox(
+                    "Choose a worksheet", sheets,
+                    key=f"sheet_{file_key}_{member}")
+
+            data_id = (file_key[0], file_key[1], member, sheet)
+
+            if st.session_state.current_upload_id != data_id:
+                with st.spinner("Loading data..."):
+                    incoming = read_dataset(file_bytes, uploaded_file.name, member, sheet)
+
+                if incoming.empty or len(incoming.columns) == 0:
+                    st.error("The selected file contains no usable data.")
+                    st.stop()
+
+                load_dataset(incoming, inner_name, data_id)
+                set_flash("success", f"Loaded {len(incoming):,} rows from {inner_name}.")
+
+        except zipfile.BadZipFile:
+            st.error("The uploaded ZIP file is invalid or corrupted.")
+            st.stop()
+        except Exception as exc:
+            st.error(f"Could not load the uploaded data: {exc}")
+            st.stop()
+
+    df = st.session_state.df
+
+    if df is None:
+        st.info("👈 Upload a CSV, XLSX or ZIP file from the sidebar to begin.")
+        st.markdown("### What this app can do")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.subheader("🧹 Data quality")
+            st.write("Profile data, fix missing values and duplicates, and undo changes.")
+        with col2:
+            st.subheader("🗺️ Spatial analytics")
+            st.write("Explore coordinates as points, clusters or a heatmap.")
+        with col3:
+            st.subheader("🤖 Machine learning")
+            st.write("Train and evaluate traffic prediction models against a baseline.")
+        st.stop()
+
+    st.sidebar.markdown("### Dataset")
+    st.sidebar.write(f"**File:** {st.session_state.uploaded_name}")
+    st.sidebar.write(f"**Rows:** {len(df):,}")
+    st.sidebar.write(f"**Columns:** {len(df.columns)}")
+
+    mapping = column_mapping_ui(df)
+
+    show_flash()
+    PAGES[page](df, mapping)
+
+    st.divider()
+    st.caption(
+        "Smart Mobility Analytics Studio V3 | "
+        "Streamlit, pandas, Plotly, Folium and scikit-learn"
+    )
+
+
+# Streamlit executes this file as a script, so call main() directly.
+main()
