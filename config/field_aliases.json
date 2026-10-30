@@ -1,0 +1,21 @@
+{
+  "_comment": "Optional extra column-name aliases. Values are ADDED to the built-in rules. Use lowercase letters and digits only (no spaces, underscores or dashes) for 'exact' and 'contains'; 'tokens' are whole words.",
+  "speed": {
+    "exact": ["spdkmh", "mediansp"],
+    "contains": [],
+    "tokens": [],
+    "exclude": []
+  },
+  "volume": {
+    "exact": ["vph", "veh15min"],
+    "contains": [],
+    "tokens": [],
+    "exclude": []
+  },
+  "road_id": {
+    "exact": ["linkref"],
+    "contains": [],
+    "tokens": [],
+    "exclude": []
+  }
+}

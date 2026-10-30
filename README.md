@@ -1,83 +1,75 @@
-# Smart Mobility Analytics Studio
+# 🚦 Smart Mobility Analytics Studio
 
-A beginner-friendly Python web application for uploading, profiling, cleaning, visualizing, and exporting transportation CSV data.
+An interactive Streamlit app for cleaning, exploring, mapping and forecasting transportation data
+(road-sensor speeds/volumes and GPS trajectories).
 
-## Features in Version 1
+> **Status:** portfolio project. The bundled sample data is **synthetic (simulated)** and exists only to demo
+> the app. Findings on it are not real traffic conclusions.
 
-- Upload CSV files
-- Preview data
-- Profile data types, missing values, unique values, and duplicates
-- Select columns for missing-value handling
-- Drop rows with missing values in selected columns
-- Fill missing numeric values using mean or median
-- Fill missing values with a constant
-- Remove exact duplicate rows
-- Convert one column to text, numeric, or date/time
-- Create histograms, scatter plots, line charts, bar charts, and correlation heatmaps
-- Download cleaned CSV and a Markdown data-quality report
+## What it does
 
-## Run locally (Windows)
+| Page | What you get |
+|---|---|
+| Overview / Quality / Explorer | Auto column detection, data-quality profile, interactive charts |
+| Cleaning | Smart cleaning (duplicates, bad coordinates, impossible values, gaps) with undo and a log |
+| **Mobility Insights** | Peak hours, congestion index, planning-time index, segment ranking, speed–flow capacity, incident detection, auto-written findings |
+| **Trips & OD** | Stops and trips from GPS traces, GPS-glitch removal, origin–destination flows and matrix |
+| **Maps** | Points, heatmap, congestion-coloured segments, hourly animation, grid zones, GeoJSON district choropleth |
+| **Forecasting** | Lag/rolling/calendar features, HistGradientBoosting / Random Forest / Ridge / LightGBM, 4 baselines, prediction intervals, time-series CV, horizon comparison |
+| Report & Export | HTML report (print to PDF), CSV, Excel, Parquet |
 
-1. Install Python 3.11 or newer from https://www.python.org/downloads/
-   - During installation, select **Add Python to PATH**.
-2. Install VS Code from https://code.visualstudio.com/
-3. Create/open this project folder in VS Code.
-4. Open **Terminal → New Terminal**.
-5. Create a virtual environment:
+## Method notes (what to say in an interview)
 
-   ```powershell
-   py -m venv .venv
-   ```
+- **Congestion index** = 1 − speed / free-flow speed, free-flow = 85th percentile of each road's speed.
+- **Planning time index** = free-flow speed ÷ 5th-percentile speed (reliability).
+- **Incidents**: speed compared with that road's typical value for the same weekday and hour (robust z-score, or IsolationForest);
+  consecutive flags are merged into one incident.
+- **Forecast evaluation is leakage-aware**: chronological split, a purge gap equal to the horizon, and every model is
+  scored against persistence, seasonal-naive, typical-profile and train-mean baselines on the *same* rows.
+  "Skill" is the improvement over the best baseline; it can be negative, and the app says so.
+- **Prediction intervals** are empirical and constant-width (from residuals on a held-out calibration slice), not per-point.
+- **Stops/trips** depend on GPS sampling rate; thresholds are adjustable.
 
-6. Activate it in PowerShell:
+## Run locally
 
-   ```powershell
-   .\.venv\Scripts\Activate.ps1
-   ```
+```bash
+python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+streamlit run app.py
+```
 
-   If PowerShell blocks activation, use Command Prompt terminal and run:
+Then click a sample button in the sidebar, or upload CSV / Excel / Parquet / ZIP.
 
-   ```bat
-   .venv\Scripts\activate.bat
-   ```
+## Test
 
-7. Install dependencies:
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
 
-   ```powershell
-   python -m pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
+`tests/test_pages_smoke.py` runs every page against a stubbed Streamlit to catch Python errors.
+It does **not** check visual layout — always click through the real app before publishing.
 
-8. Run the app:
+## Deploy (Streamlit Community Cloud)
 
-   ```powershell
-   streamlit run app.py
-   ```
+1. Push this folder to a public GitHub repo.
+2. At share.streamlit.io choose the repo, branch and `app.py`.
+3. Add the link and 3–4 screenshots (put them in `docs/screenshots/`) to this README.
 
-9. Open the local URL printed in the terminal (usually http://localhost:8501).
+## Project layout
 
-## First test
+```
+app.py            entry point
+views/            one module per page
+mobility/         logic (no Streamlit): detection, quality, insights, trips, forecasting, geo, mapping, report, dataio
+config/field_aliases.json   add your own column-name aliases without touching code
+tests/            pytest suite
+docs/             case study template, dataset notes
+scripts/          make_sample_data.py
+```
 
-On the app's welcome screen, download the sample CSV. Then upload it and test:
-- inspect the profile,
-- select `average_speed_kmh` for mean/median filling,
-- convert `timestamp` to Date/time,
-- create a line chart,
-- download the cleaned CSV and report.
+## Known limitations
 
-## Important limitations
-
-- Version 1 accepts CSV files only.
-- Mean/median filling is intended for numeric data and can distort results if used without considering the data context.
-- Converting a column to numeric or date/time turns unparseable values into missing values. Review the report.
-- Correlation does not prove causation.
-- The app processes uploaded files in the running Python process. Do not upload confidential or personally identifiable data to an untrusted deployment.
-- This is a data analysis tool, not a validated traffic forecasting system yet.
-
-## Suggested next steps
-
-1. Add a cleaning history and undo/reset button.
-2. Add data validation rules and column-role mapping for transport data.
-3. Add map visualizations when valid latitude/longitude columns are present.
-4. Add baseline and machine-learning traffic prediction with time-aware evaluation.
-5. Add tests and deployment configuration before public use.
+- Samples are simulated; the case-study document is a template you must fill with your own findings.
+- Very large files: install `pyarrow` (Parquet) and `duckdb` (fast CSV) and prefer Parquet.
+- Logs are written to `logs/app.log`.
