@@ -11,12 +11,15 @@ road-sensor speeds and volumes, GPS trajectories, and event records such as inci
 > The Dubai case study uses real Dubai Police incident records from Dubai Pulse, which are **not** included in this
 > repository (access requires a request and no licence is stated), so you must request them yourself.
 
+<<<<<<< HEAD
 ## Why I built it
 
 Open mobility data is messy: columns are named inconsistently, coordinates are swapped, load times are mistaken for event
 times, and "traffic" files often contain reports rather than measured speeds. This app detects those problems, helps fix them,
 and then answers practical questions: *when* and *where* are roads under stress, and can the pattern be forecast?
 
+=======
+>>>>>>> a55b07c705811a0679a6fd7e0ad6d671145460e3
 ## What it does
 
 | Page | What you get |
@@ -88,6 +91,7 @@ docs/                       case study, dataset notes, images, screenshots
 scripts/make_sample_data.py regenerates the synthetic samples
 ```
 
+<<<<<<< HEAD
 ## Limitations
 
 - Samples are simulated. The Dubai case study analyses reported incidents, not speeds or flows, and the source states no licence.
@@ -99,3 +103,9 @@ scripts/make_sample_data.py regenerates the synthetic samples
 ## Data
 
 See [docs/DATASETS.md](docs/DATASETS.md). Incident data: Dubai Police via [Dubai Pulse](https://www.dubaipulse.gov.ae/data/dp-traffic/dp_traffic_incidents-open) (permission required).
+=======
+>>>>>>> 11657e6b62799b1a5b4a5f93d31a128c305ff262
+- Samples are simulated; the case-study document is a template you must fill with your own findings.
+- Very large files: install `pyarrow` (Parquet) and `duckdb` (fast CSV) and prefer Parquet.
+- Logs are written to `logs/app.log`.
+>>>>>>> a55b07c705811a0679a6fd7e0ad6d671145460e3
