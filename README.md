@@ -10,8 +10,6 @@ An interactive Streamlit app for cleaning, exploring, mapping and forecasting tr
 
 [**Where and when is Dubai congested?**](docs/CASE_STUDY.md) — desk study of published reports plus an incident-data analysis run in this app.
 
-![Dashboard screenshot](docs/screenshots/01_insights.png)
-
 ## What it does
 
 | Page | What you get |
