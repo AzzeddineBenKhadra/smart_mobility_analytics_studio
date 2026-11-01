@@ -6,7 +6,6 @@ An interactive Streamlit app for cleaning, exploring, mapping and forecasting tr
 > **Status:** portfolio project. The bundled sample data is **synthetic (simulated)** and exists only to demo
 > the app. Findings on it are not real traffic conclusions.
 
-<<<<<<< HEAD
 ## Case study
 
 [**Where and when is Dubai congested?**](docs/CASE_STUDY.md) — desk study of published reports plus an incident-data analysis run in this app.
@@ -40,7 +39,7 @@ An interactive Streamlit app for cleaning, exploring, mapping and forecasting tr
 ## Run locally
 
 ```bash
-python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+python -m venv .venv && source .venv/bin/activate     # Windows: .venv\\Scripts\\activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
@@ -77,6 +76,7 @@ scripts/          make_sample_data.py
 
 ## Known limitations
 
+````
 =======
 ## What it does
 
