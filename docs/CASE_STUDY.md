@@ -66,10 +66,6 @@ Per the same report: active registered vehicles reached 4.65 million (Q3 2025) a
 |---|---|
 | `acci_id`, `acci_time`, `acci_name`, `acci_x`, `acci_y` | Time, Arabic category, coordinates. CSV, about 7 MB. |
 
-- **Access:** not a direct download. Click **Request Permission**, accept the terms, wait for approval (the page says up to 14 days). The page states no licence ("not specified") — say so in your write-up.
-- **What it measures:** *incident reports*, **not speed or flow**. It shows where and when incidents are *reported*, a proxy for stress on the network, not congestion itself. Reporting itself varies by area and time.
-- **Note:** the page labels the coordinate columns "latitude" and "longitude" but names them `acci_x`/`acci_y`. Check which is which in the app's column mapping (Dubai latitude ≈ 25.0–25.4, longitude ≈ 55.0–55.5).
-
 ### 3.2 Steps in the app
 
 1. `streamlit run app.py`, upload the CSV.
