@@ -24,7 +24,7 @@ An interactive Streamlit app for cleaning, exploring, mapping and forecasting tr
 | **Forecasting** | Lag/rolling/calendar features, HistGradientBoosting / Random Forest / Ridge / LightGBM, 4 baselines, prediction intervals, time-series CV, horizon comparison |
 | Report & Export | HTML report (print to PDF), CSV, Excel, Parquet |
 
-## Method notes (what to say in an interview)
+## Method notes
 
 - **Congestion index** = 1 − speed / free-flow speed, free-flow = 85th percentile of each road's speed.
 - **Planning time index** = free-flow speed ÷ 5th-percentile speed (reliability).
