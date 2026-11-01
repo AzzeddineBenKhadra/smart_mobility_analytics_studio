@@ -15,7 +15,7 @@ from mobility.state import cached
 from mobility.ui import fmt_minutes, metric_row, safe_section, show_df, show_plot
 from .common import get_panel, mapping_key
 
-TARGET_LABELS = {"speed": "Speed (km/h)", "volume": "Traffic volume"}
+TARGET_LABELS = {"speed": "Speed (km/h)", "volume": "Traffic volume / event count"}
 INTERVAL_OPTIONS = [1, 5, 10, 15, 30, 60]
 
 
@@ -208,12 +208,33 @@ def render(df, m):
         "statistics and calendar features. Every model is compared with simple baselines "
         "on the **latest** part of the data, so you can see whether it adds real value.")
 
-    if not m.get("timestamp") or not (m.get("speed") or m.get("volume")):
-        st.info("Forecasting needs a timestamp and a speed and/or volume column "
-                "(sidebar → Column mapping).")
+    event_mode = I.is_event_data(m)
+    if not m.get("timestamp"):
+        st.info("Forecasting needs a timestamp column (sidebar → Column mapping).")
         return
 
-    panel = get_panel(df, m)
+    event_opts = {}
+    if event_mode:
+        st.info("No speed or volume column is mapped, so each row is treated as one **event** "
+                "(e.g. an incident report). The forecast predicts the **number of events per "
+                "time step**. Time steps with no events count as 0.")
+        e1, e2, e3 = st.columns(3)
+        level = e1.selectbox("Forecast level", ["Whole area", "Busiest zones"], key="fc_level",
+                             help="'Busiest zones' needs latitude and longitude.")
+        zone_m = e2.selectbox("Zone size (m)", [1000, 2000, 5000], index=1, key="fc_zone",
+                              disabled=level == "Whole area")
+        max_days = e3.slider("Use the most recent … days", 60, 1460, 365, 30, key="fc_days",
+                             help="Older history is ignored (faster, more relevant).")
+        event_opts = {"by_zone": level == "Busiest zones" and bool(m.get("latitude"))
+                      and bool(m.get("longitude")), "zone_m": zone_m, "max_days": max_days}
+        panel = cached("event_panel", lambda: I.prepare_event_panel(df, m, **event_opts),
+                       mapping_key(m), tuple(sorted(event_opts.items())))
+    else:
+        if not (m.get("speed") or m.get("volume")):
+            st.info("Forecasting needs a timestamp and a speed and/or volume column "
+                    "(sidebar → Column mapping).")
+            return
+        panel = get_panel(df, m)
     if panel is None:
         st.warning("No usable rows: the timestamp column could not be parsed.")
         return
@@ -222,7 +243,8 @@ def render(df, m):
     c1, c2, c3 = st.columns(3)
     target = c1.selectbox("Target", targets, format_func=TARGET_LABELS.get, key="fc_target")
 
-    inferred = cached("interval", lambda: I.infer_interval_minutes(panel), mapping_key(m))
+    inferred = 60.0 if event_mode else cached(
+        "interval", lambda: I.infer_interval_minutes(panel), mapping_key(m))
     index = next((i for i, v in enumerate(INTERVAL_OPTIONS) if v >= inferred - 1e-9),
                  len(INTERVAL_OPTIONS) - 1)
     interval = c2.selectbox("Time resolution (minutes)", INTERVAL_OPTIONS, index=index,
@@ -257,15 +279,18 @@ def render(df, m):
         coverage = a2.slider("Prediction-interval coverage", 0.5, 0.95, 0.8, 0.05, key="fc_cov")
         max_roads = a3.slider("Maximum roads modelled", 5, 100, 30, 5, key="fc_roads")
         agg = "mean"
-        if target == "volume":
+        if event_mode:
+            agg = "sum"
+        elif target == "volume":
             agg = st.radio("Combine several records in one time step by",
                            ["mean", "sum"], horizontal=True, key="fc_agg")
 
     weekend = tuple(m.get("weekend_days", (5, 6)))
-    wide_key = (mapping_key(m), target, interval, agg, max_roads)
+    wide_key = (mapping_key(m), target, interval, agg, max_roads, event_mode,
+                tuple(sorted(event_opts.items())))
     with st.spinner("Preparing time series..."):
         wide, dropped = cached("fc_wide", lambda: F.make_wide(
-            panel, target, interval, agg, max_roads), wide_key)
+            panel, target, interval, agg, max_roads, zero_fill=event_mode), wide_key)
     st.caption(f"{wide.shape[0]:,} time steps × {wide.shape[1]} road(s) at "
                f"{fmt_minutes(interval)} resolution · {wide.notna().mean().mean() * 100:.0f}% "
                "of cells observed.")

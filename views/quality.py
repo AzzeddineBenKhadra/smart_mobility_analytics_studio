@@ -43,6 +43,9 @@ def render(df, m):
              "Remove exact duplicates if they are accidental."),
             ("Invalid coordinate pairs", findings["invalid_coordinates"],
              "Out of range, unparseable, half-missing, or exactly (0, 0)."),
+            ("Swapped latitude/longitude", findings.get("swapped_coordinates", 0),
+             "Latitude and longitude appear exchanged on these rows compared with the "
+             "newest records. Fix before mapping."),
             ("Unparseable timestamps", findings["invalid_timestamps"],
              "Check date formats and timezone assumptions."),
             ("Impossible speed values", findings["impossible_speed"],
@@ -76,6 +79,11 @@ def render(df, m):
         "duplicates": st.checkbox(
             f"Remove exact duplicate rows ({findings['duplicate_rows']:,})",
             disabled=findings["duplicate_rows"] == 0, key="q_dups"),
+        "swapped": st.checkbox(
+            f"Swap latitude/longitude where they look exchanged "
+            f"({findings.get('swapped_coordinates', 0):,})",
+            disabled=not has_coords or findings.get("swapped_coordinates", 0) == 0,
+            key="q_swapped"),
         "coordinates": st.checkbox(
             f"Set invalid latitude/longitude pairs to missing "
             f"({findings['invalid_coordinates']:,})",

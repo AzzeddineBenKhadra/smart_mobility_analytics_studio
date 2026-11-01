@@ -56,6 +56,55 @@ def prepare_panel(df, m):
     return panel if len(panel) else None
 
 
+def is_event_data(m):
+    """Timestamped records with no measured speed or volume (e.g. incident reports)."""
+    return bool(m.get("timestamp")) and not (m.get("speed") or m.get("volume"))
+
+
+def prepare_event_panel(df, m, by_zone=False, zone_m=2000, max_zones=10, max_days=730):
+    """Turn event records (one row = one event) into a panel for count forecasting.
+
+    Each row becomes ``volume = 1``; summing per time step gives the number of events.
+    Coordinates far from the bulk of the data (bad GPS, (0,0)) are ignored for zoning.
+    ``max_days`` keeps only the most recent period so long histories stay fast.
+    """
+    ts_col = m.get("timestamp")
+    if not ts_col or ts_col not in df.columns:
+        return None
+    panel = pd.DataFrame({"ts": parse_datetime(df[ts_col])}, index=df.index)
+    panel = panel.dropna(subset=["ts"])
+    if panel.empty:
+        return None
+    if max_days:
+        panel = panel[panel["ts"] >= panel["ts"].max() - pd.Timedelta(days=max_days)]
+
+    panel["volume"] = 1.0
+    panel["road"] = "All"
+    lat_col, lon_col = m.get("latitude"), m.get("longitude")
+    if lat_col and lon_col:
+        from .quality import swapped_coordinate_mask
+        lat = pd.to_numeric(df.loc[panel.index, lat_col], errors="coerce")
+        lon = pd.to_numeric(df.loc[panel.index, lon_col], errors="coerce")
+        swap = swapped_coordinate_mask(lat, lon, panel["ts"])
+        lat, lon = lat.where(~swap, lon), lon.where(~swap, lat)
+        ok = lat.notna() & lon.notna()
+        ok &= (lat - lat.median()).abs() < 1.5
+        ok &= (lon - lon.median()).abs() < 1.5
+        panel["lat"], panel["lon"] = lat.where(ok), lon.where(ok)
+        if by_zone and ok.any():
+            from .geo import assign_grid
+            iy, ix, _ = assign_grid(panel.loc[ok, "lat"], panel.loc[ok, "lon"], zone_m,
+                                    float(panel.loc[ok, "lat"].median()))
+            cell = pd.Series([f"{int(a)}_{int(b)}" for a, b in zip(iy, ix)],
+                             index=panel.index[ok])
+            top = cell.value_counts().head(max_zones).index.tolist()
+            names = {c: f"Zone {i + 1}" for i, c in enumerate(top)}   # Zone 1 = busiest
+            keep = cell[cell.isin(top)]
+            panel = panel.loc[keep.index].copy()
+            panel["road"] = keep.map(names).astype(object)
+    return panel.sort_values("ts", kind="stable").reset_index(drop=True)
+
+
 def infer_interval_minutes(panel, default=15.0):
     """Typical spacing between consecutive observations of one road."""
     steps = []

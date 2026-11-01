@@ -35,6 +35,40 @@ def coordinate_invalid_mask(df, lat_col, lon_col):
     return present & ~ok
 
 
+def swapped_coordinate_mask(lat, lon, order=None, tol=3.0):
+    """Rows whose latitude/longitude look swapped relative to the dataset's reference layout.
+
+    Some sources change column order over time (e.g. x/y swapped in older records).
+    The reference layout is taken from the *newest* 20% of valid rows (``order`` = a
+    sortable series such as timestamps) or, without it, from the majority of rows.
+    A row is swapped when it sits near the reference point only after exchanging its
+    two values. Returns a boolean Series aligned to ``lat``.
+    """
+    lat = pd.to_numeric(lat, errors="coerce")
+    lon = pd.to_numeric(lon, errors="coerce")
+    valid = lat.notna() & lon.notna() & ~((lat == 0) & (lon == 0))
+    out = pd.Series(False, index=lat.index)
+    if valid.sum() < 20:
+        return out
+    if order is not None:
+        ranked = order[valid].dropna().sort_values()
+        ref_idx = ranked.index[int(len(ranked) * 0.8):]
+    else:
+        ref_idx = lat.index[valid]
+    if len(ref_idx) == 0:
+        return out
+    rlat, rlon = lat[ref_idx].median(), lon[ref_idx].median()
+    near_normal = ((lat - rlat).abs() < tol) & ((lon - rlon).abs() < tol)
+    near_swapped = ((lat - rlon).abs() < tol) & ((lon - rlat).abs() < tol)
+    return valid & near_swapped & ~near_normal
+
+
+def _swap_order(df, mapping):
+    """Timestamps used to find the newest rows (None if unavailable)."""
+    ts_col = mapping.get("timestamp")
+    return parse_datetime(df[ts_col]) if ts_col else None
+
+
 def iqr_outlier_mask(values):
     valid = values.dropna()
     if len(valid) < 8:
@@ -96,6 +130,7 @@ def profile_data(df, mapping):
         "missing_pct": missing_cells / max(rows * cols, 1) * 100,
         "duplicate_rows": duplicates,
         "invalid_coordinates": 0,
+        "swapped_coordinates": 0,
         "invalid_timestamps": 0,
         "impossible_speed": 0,
         "impossible_volume": 0,
@@ -107,6 +142,8 @@ def profile_data(df, mapping):
     if lat_col and lon_col:
         findings["invalid_coordinates"] = int(
             coordinate_invalid_mask(df, lat_col, lon_col).sum())
+        findings["swapped_coordinates"] = int(swapped_coordinate_mask(
+            df[lat_col], df[lon_col], _swap_order(df, mapping)).sum())
 
     ts_col = mapping.get("timestamp")
     if ts_col:
@@ -130,6 +167,7 @@ def profile_data(df, mapping):
         min(findings["missing_pct"] * 0.35, 35)
         + min(duplicates / denom * 100 * 0.20, 20)
         + min(findings["invalid_coordinates"] / denom * 100 * 0.20, 20)
+        + min(findings["swapped_coordinates"] / denom * 100 * 0.20, 20)
         + min(findings["invalid_timestamps"] / denom * 100 * 0.10, 10)
         + min((findings["impossible_speed"] + findings["impossible_volume"])
               / denom * 100 * 0.15, 15)
@@ -139,7 +177,8 @@ def profile_data(df, mapping):
     score = max(0.0, 100 - penalty)
     # Never show a perfect 100 while known problems remain.
     has_problems = any(findings[k] for k in (
-        "missing_cells", "duplicate_rows", "invalid_coordinates", "invalid_timestamps",
+        "missing_cells", "duplicate_rows", "invalid_coordinates", "swapped_coordinates",
+        "invalid_timestamps",
         "impossible_speed", "impossible_volume"))
     findings["quality_score"] = round(min(score, 99.9) if has_problems else score, 1)
     return findings
@@ -205,6 +244,20 @@ def run_smart_cleaning(df, actions, mapping):
         entries.append(make_log_entry(
             "Smart: remove duplicate rows", "(all)", before, work,
             f"Removed {removed:,} exact duplicate rows"))
+
+    if actions.get("swapped"):
+        lat_col, lon_col = mapping["latitude"], mapping["longitude"]
+        swap = swapped_coordinate_mask(work[lat_col], work[lon_col], _swap_order(work, mapping))
+        count = int(swap.sum())
+        if count:
+            lat_vals = pd.to_numeric(work[lat_col], errors="coerce")
+            lon_vals = pd.to_numeric(work[lon_col], errors="coerce")
+            work[lat_col] = lat_vals.where(~swap, lon_vals)
+            work[lon_col] = lon_vals.where(~swap, lat_vals)
+        changes += count
+        entries.append(make_log_entry(
+            "Smart: swapped coordinates", f"{lat_col}, {lon_col}", len(work), work,
+            f"Swapped latitude/longitude on {count:,} rows to match the newest records' layout"))
 
     if actions.get("coordinates"):
         lat_col, lon_col = mapping["latitude"], mapping["longitude"]

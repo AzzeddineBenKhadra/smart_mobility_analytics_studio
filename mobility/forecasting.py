@@ -137,7 +137,7 @@ def horizon_options(interval_min, span_days):
             if h >= interval_min and h * 3 <= span_days * 1440]
 
 
-def make_wide(panel, target, interval_min, agg="mean", max_roads=30):
+def make_wide(panel, target, interval_min, agg="mean", max_roads=30, zero_fill=False):
     """Time × road matrix on a regular grid. Returns (wide, dropped_roads)."""
     secs = int(round(interval_min * 60))
     work = panel[["ts", "road", target]].dropna(subset=[target])
@@ -154,7 +154,10 @@ def make_wide(panel, target, interval_min, agg="mean", max_roads=30):
     work = work.assign(bin=work["ts"].dt.floor(f"{secs}s"))
     grouped = work.groupby(["bin", "road"])[target].agg(agg).unstack("road")
     full = pd.date_range(grouped.index.min(), grouped.index.max(), freq=f"{secs}s")
-    return grouped.reindex(full), dropped
+    wide = grouped.reindex(full)
+    if zero_fill:  # event counts: a time step with no events means 0, not "unknown"
+        wide = wide.fillna(0.0)
+    return wide, dropped
 
 
 def _steps(minutes, interval_min):

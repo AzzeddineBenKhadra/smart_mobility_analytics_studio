@@ -34,6 +34,10 @@ def _plausible(series, field):
     return True
 
 
+METADATA_TOKENS = {"load", "loaded", "ingest", "ingested", "etl", "created", "updated",
+                   "modified", "inserted", "processed", "extract", "export", "exported"}
+
+
 def detect_columns(df, rules=None):
     """Map transport fields to columns. Returns {field: column or None}."""
     rules = rules or load_field_rules()
@@ -49,10 +53,13 @@ def detect_columns(df, rules=None):
         token_set, exclude = set(rule["tokens"]), set(rule["exclude"])
         chosen = None
 
-        for tier in ("exact", "contains", "tokens"):
+        # Load/update times describe the *record*, not the event: prefer any other
+        # date column, and fall back to them only if nothing else matches.
+        variants = [exclude | METADATA_TOKENS, exclude] if field == "timestamp" else [exclude]
+        for tier, excl in ((t, e) for e in variants for t in ("exact", "contains", "tokens")):
             hits = []
             for col in columns:
-                if col in used or tokens[col] & exclude:
+                if col in used or tokens[col] & excl:
                     continue
 
                 if tier == "exact":
