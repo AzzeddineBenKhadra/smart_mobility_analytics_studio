@@ -36,14 +36,14 @@ and then answers practical questions: *when* and *where* are roads under stress,
 | ![Incidents by hour](docs/images/figA_incidents_by_hour.png) | ![Weekday and hour](docs/images/figB_weekday_hour_heatmap.png) |
 | ![Maps](docs/screenshots/02_map.png) | ![Forecasting](docs/screenshots/03_forecast.png) |
 
-## Example findings (Dubai Police incident records, last 12 months to 1 Nov 2026)
+## Example findings (Dubai Police incident records, Nov 2025 – Oct 2026)
 
-- About **310 reported incidents per day**; busiest hours **13:00, 14:00 and 16:00**; Thursday busiest, Sunday quietest.
+- About **331 reported incidents per day**; busy plateau from **13:00 to 19:00**; Thursday busiest, Sunday quietest.
 - Commute windows (07–09 and 16–19) hold 34% of incidents against 29% if spread evenly: a mild lean, not a sharp rush-hour peak.
-- **Data issue found and handled:** before about February 2026 the `acci_x` / `acci_y` columns are swapped (about 686k rows). The app detects and optionally repairs this; without it, older incidents map to the wrong place.
-- **Forecast:** hourly whole-area incident counts were **not** predicted better than a "typical weekday-hour profile" baseline (about 3.5% worse). Hour and weekday explain most of the pattern.
+- **Data issues found and handled:** swapped latitude/longitude on about 686k rows (89%) before Feb 2026, a placeholder point with 956 incidents that would otherwise be the top "hotspot", and two months that look incomplete.
+- **Forecast:** hourly whole-area incident counts were **not** predicted better than a "typical weekday-hour profile" baseline (about 3.5% worse).
 
-*These are reported incidents, not measured congestion. Busier roads also report more incidents simply because they carry more vehicles.*
+*These are reported incidents, not measured congestion. See the [case study](docs/CASE_STUDY.md).*
 
 ## Method notes
 
