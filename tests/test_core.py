@@ -120,3 +120,13 @@ def test_normalize_dtypes_keeps_plain_frames():
     from mobility.dataio import normalize_dtypes
     df = pd.DataFrame({"a": [1, 2], "b": ["x", "y"]})
     pd.testing.assert_frame_equal(normalize_dtypes(df), df)
+
+
+def test_detects_x_y_coordinates_like_dubai_incidents():
+    df = pd.DataFrame({
+        "acci_id": [1, 2, 3], "acci_name": ["a", "b", "c"],
+        "acci_time": ["2026-10-31 21:37:03", "2026-10-31 23:20:39", "2026-10-31 22:52:41"],
+        "acci_x": [55.4309, 55.3103, 55.3459], "acci_y": [25.2604, 25.2798, 25.1228]})
+    m = detect_columns(df)
+    assert m["timestamp"] == "acci_time"
+    assert m["longitude"] == "acci_x" and m["latitude"] == "acci_y"

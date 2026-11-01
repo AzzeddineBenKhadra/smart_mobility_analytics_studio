@@ -77,7 +77,31 @@ def detect_columns(df, rules=None):
         if chosen:
             used.add(chosen)
 
+    _fallback_xy_coordinates(df, detected, used, tokens)
     return detected
+
+
+def _fallback_xy_coordinates(df, detected, used, tokens):
+    """Many open-data files call coordinates x / y (e.g. ``acci_x``, ``acci_y``).
+
+    GIS convention: x = longitude (east-west), y = latitude (north-south). We only
+    accept the pair when the values fit real coordinate ranges, and the sidebar
+    mapping lets the user swap them.
+    """
+    if detected.get("latitude") or detected.get("longitude"):
+        return
+    xs = [c for c in df.columns if c not in used and tokens[c] & {"x"} and is_numeric_col(df[c])]
+    ys = [c for c in df.columns if c not in used and tokens[c] & {"y"} and is_numeric_col(df[c])]
+    if not xs or not ys:
+        return
+    lon_col, lat_col = xs[0], ys[0]
+    lon = pd.to_numeric(df[lon_col], errors="coerce").dropna()
+    lat = pd.to_numeric(df[lat_col], errors="coerce").dropna()
+    if lon.empty or lat.empty:
+        return
+    if lon.between(-180, 180).mean() < 0.9 or lat.between(-90, 90).mean() < 0.9:
+        return
+    detected["longitude"], detected["latitude"] = lon_col, lat_col
 
 
 def detect_speed_unit(df, speed_col):
