@@ -130,3 +130,38 @@ def test_detects_x_y_coordinates_like_dubai_incidents():
     m = detect_columns(df)
     assert m["timestamp"] == "acci_time"
     assert m["longitude"] == "acci_x" and m["latitude"] == "acci_y"
+
+
+def test_timestamp_prefers_event_time_over_load_time():
+    df = pd.DataFrame({
+        "acci_time": ["2026-10-31 21:37:03", "2026-10-31 23:20:39"],
+        "load_timestamp": ["2026-11-01 05:00:20", "2026-11-01 04:30:19"],
+        "acci_x": [55.43, 55.31], "acci_y": [25.26, 25.28]})
+    assert detect_columns(df)["timestamp"] == "acci_time"
+
+
+def test_event_count_forecast_and_swapped_coordinates():
+    import numpy as np
+    from mobility import forecasting as F
+    rng = np.random.default_rng(0)
+    n = 6000
+    ts = pd.Timestamp("2026-01-01") + pd.to_timedelta(rng.integers(0, 60 * 86400, n), unit="s")
+    x, y = rng.normal(55.3, .05, n), rng.normal(25.2, .03, n)
+    old = ts < pd.Timestamp("2026-01-20")             # older rows have x/y exchanged
+    x2, y2 = np.where(old, y, x), np.where(old, x, y)
+    df = pd.DataFrame({"acci_time": ts, "acci_x": x2, "acci_y": y2})
+    m = detect_columns(df)
+    assert I.is_event_data(m)
+    panel = I.prepare_event_panel(df, m, by_zone=True, max_days=365)
+    assert panel["lat"].between(25, 25.4).all()       # swap repaired
+    wide, _ = F.make_wide(panel, "volume", 60, "sum", 10, zero_fill=True)
+    assert wide.notna().all().all() and wide.shape[0] > 24 * 30
+
+
+def test_event_findings_text():
+    ts = pd.Timestamp("2026-03-01") + pd.to_timedelta(
+        np.random.default_rng(1).integers(0, 30 * 86400, 3000), unit="s")
+    df = pd.DataFrame({"acci_time": ts})
+    m = detect_columns(df)
+    lines = I.generate_event_findings(I.prepare_event_panel(df, m), (5, 6))
+    assert len(lines) >= 4 and "events over" in lines[0]

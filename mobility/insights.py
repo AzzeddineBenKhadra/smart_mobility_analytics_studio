@@ -105,6 +105,57 @@ def prepare_event_panel(df, m, by_zone=False, zone_m=2000, max_zones=10, max_day
     return panel.sort_values("ts", kind="stable").reset_index(drop=True)
 
 
+def event_counts_by_hour(panel, weekend_days=(5, 6)):
+    """Average events per hour-slot, split weekday/weekend (empty hours count as 0)."""
+    hourly = panel.assign(slot=panel["ts"].dt.floor("h")).groupby("slot").size()
+    full = pd.date_range(hourly.index.min().normalize(),
+                         hourly.index.max().normalize() + pd.Timedelta(hours=23), freq="h")
+    hourly = hourly.reindex(full, fill_value=0)
+    out = pd.DataFrame({"n": hourly.to_numpy()}, index=full)
+    out["hour"] = out.index.hour
+    out["dow"] = out.index.dayofweek
+    out["day_type"] = np.where(is_weekend(out.index.to_series(), weekend_days),
+                               "Weekend", "Weekday")
+    return out
+
+
+def event_heat_table(counts):
+    table = counts.groupby(["dow", "hour"])["n"].mean().unstack()
+    table = table.reindex(index=range(7), columns=range(24))
+    table.index = DAY_NAMES
+    return table
+
+
+def generate_event_findings(panel, weekend_days=(5, 6)):
+    """Plain-language findings for event (incident) data."""
+    counts = event_counts_by_hour(panel, weekend_days)
+    findings = []
+    days = max(counts.index.normalize().nunique(), 1)
+    findings.append(f"{len(panel):,} events over {days:,} days "
+                    f"(about {len(panel) / days:.0f} per day).")
+
+    by_hour = counts.groupby("hour")["n"].mean()
+    top = by_hour.sort_values(ascending=False).head(3).index.sort_values()
+    findings.append("Busiest hours of the day: "
+                    + ", ".join(f"{h:02d}:00" for h in top)
+                    + f" (about {by_hour.max():.1f} events per hour at the peak, "
+                      f"{by_hour.min():.1f} at the quietest hour).")
+
+    by_day = counts.groupby(["dow"])["n"].sum() / counts.groupby("dow").apply(
+        lambda g: g.index.normalize().nunique())
+    findings.append(f"Busiest weekday: {DAY_NAMES[int(by_day.idxmax())]} "
+                    f"({by_day.max():.0f}/day); quietest: {DAY_NAMES[int(by_day.idxmin())]} "
+                    f"({by_day.min():.0f}/day).")
+
+    commute = by_hour.reindex([7, 8, 9, 16, 17, 18, 19]).sum()
+    findings.append(f"The usual commute windows (07–09 and 16–19) hold "
+                    f"{commute / by_hour.sum() * 100:.0f}% of events — a flat share would be "
+                    f"{7 / 24 * 100:.0f}%.")
+    findings.append("These are reported events, not measured congestion; busier roads "
+                    "also report more events simply because they carry more vehicles.")
+    return findings
+
+
 def infer_interval_minutes(panel, default=15.0):
     """Typical spacing between consecutive observations of one road."""
     steps = []

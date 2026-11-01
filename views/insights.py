@@ -283,10 +283,13 @@ def _distributions_tab(df, panel, m):
 def render(df, m):
     st.header("Mobility Insights")
 
-    if not m.get("timestamp") or not (m.get("speed") or m.get("volume")):
-        needs = missing_fields_message(m, ["timestamp"]) or "speed or volume"
-        st.info(f"This page needs a timestamp and a speed and/or volume column. "
-                f"Missing: {needs}. Set them in the sidebar under **Column mapping**.")
+    if not m.get("timestamp"):
+        st.info("This page needs a timestamp column. Set it in the sidebar under "
+                "**Column mapping**.")
+        return
+    if I.is_event_data(m):
+        from . import event_insights
+        event_insights.render(df, m)
         return
 
     with st.expander("Settings"):
