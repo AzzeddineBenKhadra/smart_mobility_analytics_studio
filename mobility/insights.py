@@ -111,7 +111,11 @@ def event_counts_by_hour(panel, weekend_days=(5, 6)):
     full = pd.date_range(hourly.index.min().normalize(),
                          hourly.index.max().normalize() + pd.Timedelta(hours=23), freq="h")
     hourly = hourly.reindex(full, fill_value=0)
-    out = pd.DataFrame({"n": hourly.to_numpy()}, index=full)
+    # Whole days with no events at all are data outages, not quiet days: drop them so
+    # averages are not dragged down.
+    daily = hourly.groupby(hourly.index.normalize()).transform("sum")
+    hourly = hourly[daily > 0]
+    out = pd.DataFrame({"n": hourly.to_numpy()}, index=hourly.index)
     out["hour"] = out.index.hour
     out["dow"] = out.index.dayofweek
     out["day_type"] = np.where(is_weekend(out.index.to_series(), weekend_days),
@@ -154,6 +158,24 @@ def generate_event_findings(panel, weekend_days=(5, 6)):
     findings.append("These are reported events, not measured congestion; busier roads "
                     "also report more events simply because they carry more vehicles.")
     return findings
+
+
+def placeholder_coordinates(lat, lon, min_count=100, min_share=0.002, decimals=5):
+    """Exact coordinates repeated suspiciously often (e.g. a default location).
+
+    Real incidents rarely share the *exact* same point hundreds of times; such a
+    point is usually a placeholder, and it would otherwise show up as a fake hotspot.
+    Returns (mask of affected rows, DataFrame of the repeated points).
+    """
+    key = pd.DataFrame({"lat": lat.round(decimals), "lon": lon.round(decimals)})
+    counts = key.groupby(["lat", "lon"]).size()
+    limit = max(min_count, min_share * len(key))
+    bad = counts[counts >= limit]
+    if bad.empty:
+        return pd.Series(False, index=lat.index), pd.DataFrame(columns=["lat", "lon", "count"])
+    idx = pd.MultiIndex.from_frame(key)
+    mask = pd.Series(idx.isin(bad.index), index=lat.index)
+    return mask, bad.reset_index(name="count").sort_values("count", ascending=False)
 
 
 def infer_interval_minutes(panel, default=15.0):

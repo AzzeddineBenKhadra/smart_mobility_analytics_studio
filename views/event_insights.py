@@ -24,7 +24,7 @@ def _category_columns(df):
 
 
 def render(df, m):
-    st.header("Mobility Insights — event data")
+    st.subheader("Event data")
     st.info("No speed or volume column is mapped, so each row is treated as one **event** "
             "(for example an incident report). The charts show **when and where events are "
             "reported**, not measured congestion.")
@@ -77,6 +77,16 @@ def render(df, m):
         else:
             cell_m = st.selectbox("Zone size (m)", [500, 1000, 2000], index=1, key="ev_cell")
             geo = panel.dropna(subset=["lat", "lon"])
+            repeated_mask, repeated = I.placeholder_coordinates(geo["lat"], geo["lon"])
+            if repeated_mask.any():
+                top = repeated.iloc[0]
+                st.warning(
+                    f"{int(repeated_mask.sum()):,} events share {len(repeated)} exact point(s), "
+                    f"for example {int(top['count']):,} at ({top['lat']:.5f}, {top['lon']:.5f}). "
+                    "That is usually a default or placeholder location, not a real hotspot.")
+                if st.checkbox("Exclude these repeated points from the hotspot ranking",
+                               value=True, key="ev_excl"):
+                    geo = geo[~repeated_mask]
             cells = aggregate_grid(geo, "lat", "lon", cell_m)
             cells = cells.sort_values("count", ascending=False).head(15).copy()
             cells["share_pct"] = (cells["count"] / len(geo) * 100).round(2)

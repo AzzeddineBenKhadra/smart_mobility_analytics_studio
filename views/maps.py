@@ -144,6 +144,19 @@ def render(df, m):
         st.warning("No valid coordinate pairs were found.")
         return
 
+    if m.get("timestamp"):
+        from mobility.quality import swapped_coordinate_mask
+        from mobility.utils import parse_datetime
+        n_swapped = cached(
+            "swapped_count",
+            lambda: int(swapped_coordinate_mask(
+                df[m["latitude"]], df[m["longitude"]], parse_datetime(df[m["timestamp"]])).sum()),
+            m["latitude"], m["longitude"], m["timestamp"])
+        if n_swapped:
+            st.warning(f"{n_swapped:,} rows look as if latitude and longitude are swapped, so "
+                       "they may appear in the wrong place. Fix this under **Data Quality → "
+                       "Swap latitude/longitude** before using the maps.")
+
     tabs = st.tabs(["Points & heatmap", "Segment congestion", "Congestion by hour",
                     "Grid zones", "District polygons"])
     with tabs[0], safe_section("Point map"):

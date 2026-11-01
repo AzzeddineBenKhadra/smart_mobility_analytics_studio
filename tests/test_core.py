@@ -165,3 +165,10 @@ def test_event_findings_text():
     m = detect_columns(df)
     lines = I.generate_event_findings(I.prepare_event_panel(df, m), (5, 6))
     assert len(lines) >= 4 and "events over" in lines[0]
+
+
+def test_placeholder_coordinates_flagged():
+    lat = pd.Series([25.0758] * 300 + list(np.linspace(25.1, 25.3, 700)))
+    lon = pd.Series([54.9473] * 300 + list(np.linspace(55.2, 55.4, 700)))
+    mask, table = I.placeholder_coordinates(lat, lon)
+    assert mask.sum() == 300 and len(table) == 1

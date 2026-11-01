@@ -66,7 +66,7 @@ Per the same report: active registered vehicles reached 4.65 million (Q3 2025) a
 | Source | *Traffic Incidents*, Dubai Police via [Dubai Pulse](https://www.dubaipulse.gov.ae/data/dp-traffic/dp_traffic_incidents-open) (access by request; licence "not specified") |
 | Size / period | 767,385 rows, 13 Aug 2018 – 1 Nov 2026 |
 | Fields | incident id, category (Arabic text), incident time, two coordinate columns, a load timestamp |
-| Window analysed | **1 Nov 2025 – 31 Oct 2026** (113,325 incidents on 342 days that contain data) |
+| Window analysed | **1 Nov 2025 – 31 Oct 2026** (about 113,000 incidents on 342 days that contain data) |
 | Not in the repository | The raw file is not published here because of the access terms. |
 
 The data contains **no speed and no traffic volume**, so the app's congestion index and reliability measures cannot be computed from it. This analysis therefore answers *when and where incidents are reported*, which is a proxy for stress on the road network, not a measure of congestion.
@@ -90,7 +90,7 @@ The data contains **no speed and no traffic volume**, so the app's congestion in
 ![Incidents by hour](images/figA_incidents_by_hour.png)
 *Figure 3: average incidents per day by hour (shaded: usual commute windows).*
 
-- Average **331 incidents per day on days with data**.
+- Average **about 330 incidents per day on days with data**.
 - Busiest hours **13:00–14:00 (about 20 per hour) and 16:00–19:00 (about 19 per hour)**; quietest 03:00–04:00 (about 5 per hour).
 - The usual commute windows (07–09 and 16–19) hold **34% of incidents against 29%** if reports were spread evenly. The pattern is a broad afternoon-to-evening plateau, **not** a sharp 7–9 am / 5–7 pm rush-hour spike.
 - Busiest weekday **Thursday (about 350 per day)**; quietest **Sunday (about 280)**. Saturday is about 345, so the Sat–Sun "weekend" label hides a very different Saturday and Sunday.

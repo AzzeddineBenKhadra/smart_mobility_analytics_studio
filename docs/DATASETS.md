@@ -1,4 +1,4 @@
-# Dataset 
+# Dataset ideas (check each licence and find the current download page yourself)
 
 - Road sensors: Caltrans PeMS; METR-LA / PEMS-BAY (common forecasting benchmarks); city open-data traffic counters.
 - Trips / OD: NYC TLC trip records; city bike-share trip data.
