@@ -1,4 +1,4 @@
-# Where and when is Dubai congested?
+# When and where do road incidents happen in Dubai?
 
 **A mobility case study using Smart Mobility Analytics Studio**
 
@@ -12,9 +12,9 @@
 
 ## 1. Question
 
-1. **When** during the day and week is Dubai's road network most congested?
-2. **Where** are the recurring hotspots?
-3. How reliable are conclusions from open data, and what would be needed to go further?
+1. **When** during the day and week are road incidents reported in Dubai, and does that match the published picture of rush-hour congestion?
+2. **Where** are the recurring incident hotspots?
+3. How far can open incident data go in answering questions about congestion, and what else would be needed?
 
 ## 2. Desk study: what published sources say
 

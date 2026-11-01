@@ -3,7 +3,7 @@
 An interactive Streamlit app for cleaning, exploring, mapping and forecasting transportation data:
 road-sensor speeds and volumes, GPS trajectories, and event records such as incident reports.
 
-**[▶ Live demo](https://smartmobility.streamlit.app)** · **[Case study: Dubai incidents](docs/CASE_STUDY.md)**
+**[▶ Live demo](https://smartmobility.streamlit.app)** · **[Case study: when and where do road incidents happen in Dubai?](docs/CASE_STUDY.md)**
 
 ![Mobility Insights](docs/screenshots/01_insights.png)
 
